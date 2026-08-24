@@ -143,24 +143,29 @@ def main() -> None:
             config["clustering"],
             marker_columns,
         )
-        transfer_profiles = profiles.join(tsam_profiles[marker_columns])
-        all_result = result.clustering.apply(transfer_profiles)
-        representatives = all_result.cluster_representatives.drop(
-            columns=marker_columns
+        cluster_centers = result.clustering.cluster_centers
+        if cluster_centers is None:
+            raise ValueError(
+                "TSAM did not return historical center indices. Use medoid "
+                "representation with the ACES writer."
+            )
+        representatives = build_pyomo_representatives(
+            profiles,
+            [int(center) + 1 for center in cluster_centers],
+            len(hours),
         )
-        cluster_weights = get_tsam_cluster_weights(all_result)
+        cluster_weights = get_tsam_cluster_weights(result)
         representative_source_days = map_representative_source_days(
             representatives,
-            result.clustering.cluster_centers,
+            cluster_centers,
             seasons,
         )
-        cluster_assignments = list(all_result.clustering.cluster_assignments)
-        accuracy = AccuracySummary(
-            rmse=all_result.accuracy.rmse.reindex(profiles.columns),
-            mae=all_result.accuracy.mae.reindex(profiles.columns),
-            rmse_duration=all_result.accuracy.rmse_duration.reindex(
-                profiles.columns
-            ),
+        cluster_assignments = list(result.clustering.cluster_assignments)
+        accuracy = calculate_pyomo_accuracy(
+            profiles=profiles,
+            representatives=representatives,
+            cluster_assignments=cluster_assignments,
+            cluster_weights=cluster_weights,
         )
         forced_day_ids = sorted(
             {int(record["day_id"]) for record in extreme_records}

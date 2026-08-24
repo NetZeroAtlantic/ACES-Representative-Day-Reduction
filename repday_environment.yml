@@ -1,0 +1,19 @@
+name: repday-env
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - matplotlib
+  - scipy
+  - scikit-learn
+  - pyomo
+  - openpyxl
+  - xlrd
+  - jupyterlab
+  - pip
+  - pip:
+      - seaborn

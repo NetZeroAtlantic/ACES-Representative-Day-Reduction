@@ -1,0 +1,38 @@
+# Local ACES inputs and generated outputs
+data/
+output/
+extra_attributes/*
+!extra_attributes/.gitkeep
+
+# Databases and generated spreadsheet/audit files
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Python caches and environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Tool and editor files
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Outputs from the older standalone package
+aces_tsam/output/
+aces_tsam/sqlite_schema.csv
+
+# Superseded local prototypes retained outside the clean GitHub project
+aces_tsam/
+configs/
+scripts/run_aces_tsam.py
+representative_day_clustering_pyomo.py

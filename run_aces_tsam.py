@@ -45,7 +45,10 @@ class PyomoAcesResult:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Reduce an hourly ACES SQLite database to representative days."
+        description=(
+            "Reduce an hourly ACES SQLite database using TSAM clustering or "
+            "Pyomo-based duration-curve exceedance-error minimization."
+        )
     )
     parser.add_argument(
         "config", nargs="?", default="aces_tsam_8760.yaml", help="YAML configuration"
@@ -905,7 +908,8 @@ def run_pyomo(
         cluster_weights=cluster_weights,
     )
     print(
-        f"Pyomo selected {len(selected_day_ids)} days; "
+        "Duration-curve optimization selected "
+        f"{len(selected_day_ids)} days using Pyomo; "
         f"{len(forced_day_ids)} were forced extreme/manual days."
     )
     return PyomoAcesResult(
@@ -1710,6 +1714,10 @@ def write_audits(
                 "unique_forced_extreme_days": len(forced_source_days),
                 "extreme_reason_rows": len(extremes),
                 "pyomo_objective_value": objective_value,
+                "pyomo_objective_definition": (
+                    "Profile-weighted absolute error between full-year and "
+                    "representative-day exceedance shares across duration-curve bins"
+                ),
                 "important_note": (
                     "Nearest assignment counts are diagnostic. ACES SegFrac "
                     "uses representative weights."

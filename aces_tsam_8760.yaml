@@ -11,8 +11,8 @@
 # 7. Write a copied ACES database using selected source dates and weighted SegFrac rows.
 #
 # CURRENT SETTINGS SUMMARY:
-# - Engine: Pyomo.
-# - Method: hybrid random day selection followed by optimized weights.
+# - Engine: duration-curve exceedance-error minimization modeled with Pyomo.
+# - Method: hybrid random historical-day selection followed by optimized weights.
 # - Weight model: continuous linear optimization using HiGHS.
 # - Random trials: 10 reproducible selections for an initial end-to-end test.
 # - Requested count: exactly 15 representative days, including forced extremes.
@@ -105,7 +105,9 @@ aces:
 
 clustering:
   # tsam = statistical clustering through TSAM.
-  # pyomo = use the Pyomo method selected under pyomo.solution_method.
+  # pyomo = minimize duration-curve exceedance error using a Pyomo model.
+  # Pyomo is the optimization framework; solution_method selects the actual
+  # representative-day search procedure.
   # pyomo_milp = compatibility alias for pyomo + formulation: milp.
   # pyomo_lp_fixed_days = compatibility alias for Pyomo weight optimization
   # using an exact user-supplied fixed_day_ids list.
@@ -248,17 +250,29 @@ clustering:
 
   pyomo:
     # This entire block is used when clustering.engine is pyomo or a Pyomo alias.
+    # Both solution methods minimize the same objective:
+    #
+    #   sum over profiles and bins of:
+    #     profile_weight * absolute(
+    #       full_year_exceedance_share
+    #       - weighted_representative_day_exceedance_share
+    #     )
+    #
+    # An exceedance share is the fraction of hourly values greater than or equal
+    # to a duration-curve bin threshold. This objective approximates annual value
+    # distributions; it does not minimize chronological H00-to-H00 reconstruction.
     #
     # solution_method: opt
-    #   One optimization model chooses the representative days and their weights
-    #   together. With formulation: milp, binary variables decide which historical
-    #   days are selected. This searches systematically but can be expensive.
+    #   One Pyomo optimization model chooses the representative days and their
+    #   occurrence weights together. With formulation: milp, binary variables
+    #   decide which historical days are selected. This searches systematically
+    #   for the minimum binned duration-curve exceedance error but can be expensive.
     #
     # solution_method: hybrid_random_weighting
     #   Python randomly chooses exactly n_representative_days, treating that random
-    #   choice like a fixed binary assignment. Pyomo then changes only the weights
-    #   to minimize duration-curve error. This repeats n_random_iterations times,
-    #   and the lowest-error solution is retained. This is your random method.
+    #   choice like a fixed binary assignment. Pyomo then changes only occurrence
+    #   weights to minimize the same binned duration-curve exceedance error. This
+    #   repeats n_random_iterations times, and the lowest-error result is retained.
     #   After selection, every original day is assigned to its nearest selected day
     #   for the audit CSV. Those nearest-day counts do not replace the optimized
     #   Pyomo weights; SegFrac uses the optimized weights.
@@ -282,10 +296,10 @@ clustering:
     # Every forced extreme must also be listed here when using lp_fixed_days.
     fixed_day_ids: []
 
-    # Duration-curve resolution used in the objective.
-    # More bins preserve more distribution detail but create a larger model.
-    # The objective does not compare the original and representative years
-    # hour-by-hour; it compares annual exceedance shares at these bin thresholds.
+    # Number of duration-curve thresholds used in the objective for every profile.
+    # More bins describe annual distributions in more detail but create a larger
+    # model. The objective compares annual exceedance shares at these thresholds;
+    # it does not compare original and representative years hour by hour.
     n_bins: 30
 
     # Normalize every selected profile before calculating error.

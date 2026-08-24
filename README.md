@@ -1,11 +1,18 @@
-# ACES 8760 Representative-Day Clustering
+# ACES 8760 Representative-Day Reduction
 
-This tool reads the native ACES SQLite schema, reduces 8,760/8,784 hourly values into weighted representative days with TSAM or Pyomo, and writes a reduced ACES database. Representative seasons use selected historical dates, such as `01-17`, rather than generated names such as `R01`.
+This tool reads the native ACES SQLite schema, reduces 8,760/8,784 hourly values into weighted representative days, and writes a reduced ACES database. Representative seasons use selected historical dates, such as `01-17`, rather than generated names such as `R01`.
+
+It provides two distinct engines:
+
+- **TSAM:** clusters statistically similar historical days using methods such as hierarchical clustering, k-means, or k-medoids.
+- **Duration-curve optimization:** formulates representative-day selection and/or occurrence-weight optimization in Pyomo. The objective minimizes weighted absolute error between full-year exceedance shares and representative-day exceedance shares across configurable duration-curve bins. Pyomo is the optimization modeling framework, not the name of the reduction method.
+
+The duration-curve optimization does not minimize chronological H00-to-H00 reconstruction error. It approximates the annual distributions of demand, wind, solar, and other selected profiles. Profile weights determine the relative importance of each distribution in the objective.
 
 ## Files
 
 - `aces_tsam_8760.yaml`: the only configuration file.
-- `run_aces_tsam.py`: ACES representative-day runner for TSAM and Pyomo.
+- `run_aces_tsam.py`: ACES runner for TSAM clustering and Pyomo-based duration-curve optimization.
 - `extra_attributes/`: optional timestamped CSV or Excel inputs.
 - `data/`: place the original 8,760/8,784-hour ACES SQLite database here.
 - `output/`: reduced SQLite database and audit CSV files.
@@ -38,17 +45,29 @@ Edit `aces_tsam_8760.yaml`:
 
 - `project.input_database`: input ACES SQLite path.
 - `clustering.n_representative_days`: normal cluster count.
-- `clustering.engine`: `tsam` or `pyomo`.
+- `clustering.engine`: `tsam` for statistical clustering or `pyomo` for duration-curve exceedance-error minimization.
 - `clustering.tsam.cluster.method`: `hierarchical`, `kmeans`, `kmedoids`, `kmaxoids`, `averaging`, or `contiguous`.
 - `clustering.tsam.cluster.representation.type`: output profile representation.
 - `clustering.attributes`: included ACES tables and profile weights.
 - `clustering.tsam.extremes`: peak-load, low-wind, and other forced extreme days.
-- `clustering.pyomo.solution_method`: `opt` or `hybrid_random_weighting`.
+- `clustering.pyomo.solution_method`: `opt` or `hybrid_random_weighting`; both minimize the same binned duration-curve exceedance error.
 - `clustering.pyomo.extremes`: exact profile-based extreme days forced inside the requested Pyomo count.
 
 With `extremes.method: new_cluster`, forced extremes are added to the requested normal count. For example, 12 normal clusters can produce 14 final representative days. Use `append` or `new_cluster` in the current ACES runner. Standard TSAM `replace` is not currently preserved when the clustering is transferred to the complete database profile matrix.
 
-For Pyomo, forced extremes always count inside `n_representative_days`. With 15 requested days and five unique forced extremes, Pyomo keeps those five and chooses ten more. `opt` chooses days and weights together. `hybrid_random_weighting` repeatedly samples fixed day sets, optimizes only their occurrence weights, and keeps the lowest duration-curve error.
+For duration-curve optimization, forced extremes always count inside `n_representative_days`. With 15 requested days and five unique forced extremes, the method keeps those five and chooses ten more. `opt` uses Pyomo to choose days and weights together. `hybrid_random_weighting` repeatedly samples fixed historical-day sets, uses Pyomo to optimize only their occurrence weights, and retains the set with the lowest weighted binned exceedance-share error.
+
+### Duration-Curve Objective
+
+For every selected profile and every configured bin, the optimization compares:
+
+```text
+full-year share of hours above the bin threshold
+versus
+weighted representative-day share of hours above the same threshold
+```
+
+The objective minimizes the profile-weighted sum of the absolute differences. `n_bins` controls the number of thresholds: more bins describe the duration curve in greater detail but increase model size and runtime.
 
 ## Extra Attributes
 

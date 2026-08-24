@@ -1,4 +1,4 @@
-"""Representative-day clustering package."""
+"""Representative-day duration-curve optimization package."""
 from .config import AttributeConfig, ClusteringConfig, SolverConfig, OutputConfig, RunConfig
 from .runner import RepresentativeDayPipeline
 

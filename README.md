@@ -225,6 +225,10 @@ Supported controls are exact profile rules (`max_value`, `min_value`, `max_perio
 
 `include_max_daily_ramp_day` can force one demand-ramp day for each selected region. Set `reference_period` to `first_model_period` or an explicit ACES period, set `regions` to `all` or a list, and choose `direction: absolute`, `upward`, or `downward`. The calculation combines the selected DSD profiles within each region after normalizing their shapes. It compares H00-H01 through H22-H23 and does not compare H23 with the following day's H00.
 
+`include_max_net_load_ramp_day` provides a separate regional net-load rule. It calculates actual hourly electricity demand from `Demand`, `DemandSpecificDistribution`, and `SegFrac`. It then sums every `ExistingCapacity` vintage for each configured technology and multiplies that capacity by its `CapacityFactorTech` profile. The resulting screening profile is `actual demand - available existing generation`. This is available generation, not optimized dispatch. Table names, column names, demand commodity, regions, reference period, technologies, CF table, and ramp direction are editable in YAML.
+
+The net-load calculation supports annual demand in PJ, TWh, GWh, or MWh and existing capacity in GW, MW, or kW. Use `segfrac.mode: uniform_full_year` when every source hour has equal duration. Use `segfrac.mode: database` only when the input contains one positive `SegFrac` row per source hour and those values sum to one. A technology with zero recorded capacity in a region contributes zero. A technology with positive capacity must have exactly one matching hourly CF profile in the configured temporal table.
+
 If multiple rules select the same date, it counts once but every reason is retained in the audit output.
 
 ## Profile Selection and Weights

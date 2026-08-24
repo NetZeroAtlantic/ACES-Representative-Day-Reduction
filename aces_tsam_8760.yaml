@@ -357,6 +357,78 @@ clustering:
         # downward = largest decrease from one hour to the next.
         direction: absolute
 
+      # Force one maximum net-load-ramp day for every configured region.
+      # Net load = actual electricity demand - available generation from the
+      # selected existing technologies. This option is independent of the
+      # normalized demand-ramp rule above.
+      include_max_net_load_ramp_day:
+        enabled: false  # Change to true to activate this rule.
+
+        # Uses the earliest DSD period, or replace with an explicit value such as 2025.
+        reference_period: first_model_period
+
+        # all uses every region that has the configured demand profile.
+        # Example subset: [NL, NS, NB, PEI]
+        regions: all
+
+        # absolute = largest change in either direction.
+        # upward   = largest increase in net load.
+        # downward = largest decrease in net load.
+        direction: absolute
+
+        demand:
+          # Annual demand is converted to GW using DSD and SegFrac:
+          # demand_GW = annual_energy_GWh * DSD / (SegFrac * calendar_hours).
+          # Supported annual demand units are PJ, TWh, GWh, and MWh.
+          annual_table: Demand
+          region_column: regions
+          period_column: periods
+          commodity_column: demand_comm
+          value_column: demand
+          unit_column: demand_units
+          commodity: D_ELEC
+
+          # The matching hourly demand profile must be loaded under
+          # aces.temporal_tables above.
+          profile_table: DemandSpecificDistribution
+
+          segfrac:
+            # uniform_full_year assigns every source hour 1/(days*24). Use this
+            # for an hourly full-year database even if it was copied from an old
+            # representative-day database whose SegFrac rows were not replaced.
+            # database reads and validates the table and columns below instead.
+            mode: uniform_full_year
+            table: SegFrac
+            season_column: season_name
+            hour_column: time_of_day_name
+            value_column: segfrac
+
+        existing_generation:
+          # ExistingCapacity is indexed by region, technology, and vintage.
+          # Every vintage row for the same region and technology is summed.
+          # No lifetime or retirement filtering is applied.
+          capacity_table: ExistingCapacity
+          region_column: regions
+          tech_column: tech
+          value_column: exist_cap
+          unit_column: exist_cap_units
+
+          # Default location of hourly CF profiles. A technology can override
+          # this table in its entry below. Supported capacity units are GW, MW,
+          # and kW.
+          capacity_factor_table: CapacityFactorTech
+
+          # String form uses the default CF table:
+          technologies:
+            - E_WIND-ON_EX
+
+          # Mapping form can identify a different loaded CF table:
+          # technologies:
+          #   - tech: E_WIND-ON_EX
+          #     capacity_factor_table: CapacityFactorTech
+          #   - tech: E_SOLPV_EX
+          #     capacity_factor_table: CapacityFactorTech
+
     # Prevent selected days from receiving zero occurrence weight.
     enforce_positive_weight: true
     minimum_weight: 1.0

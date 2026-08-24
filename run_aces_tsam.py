@@ -86,6 +86,7 @@ def main() -> None:
     print(f"Clustering with {len(selected_columns)} selected profiles.")
     engine = str(config["clustering"]["engine"]).lower()
     validate_clustering_settings(
+        database=database,
         profiles=profiles,
         selected_columns=selected_columns,
         metadata=metadata,
@@ -102,6 +103,7 @@ def main() -> None:
         return
 
     extreme_records = build_extreme_audit_records(
+        database=database,
         profiles=profiles,
         selected_columns=selected_columns,
         metadata=metadata,
@@ -132,6 +134,7 @@ def main() -> None:
         objective_value = None
     elif engine in {"pyomo", "pyomo_milp", "pyomo_lp_fixed_days"}:
         pyomo_result = run_pyomo(
+            database=database,
             profiles=profiles,
             selected_columns=selected_columns,
             column_weights=column_weights,
@@ -186,6 +189,7 @@ def main() -> None:
 
 
 def validate_clustering_settings(
+    database: Path,
     profiles: pd.DataFrame,
     selected_columns: list[str],
     metadata: dict[str, ProfileMetadata],
@@ -270,6 +274,7 @@ def validate_clustering_settings(
                 "output so representative profiles remain exact historical days."
             )
         build_extreme_audit_records(
+            database=database,
             profiles=profiles,
             selected_columns=selected_columns,
             metadata=metadata,
@@ -358,6 +363,7 @@ def validate_clustering_settings(
         raise ValueError("Unsupported clustering.pyomo.candidate_feature_mode.")
 
     extreme_records = build_extreme_audit_records(
+        database=database,
         profiles=profiles,
         selected_columns=selected_columns,
         metadata=metadata,
@@ -507,7 +513,8 @@ def load_temporal_table(
     matrix = np.full((len(seasons) * len(hours), len(key_rows)), np.nan)
 
     selected = key_columns + [season_column, hour_column, value_column]
-    query = f'SELECT {", ".join(f"""\"{column}\"""" for column in selected)} FROM "{table}"'
+    selected_columns = ", ".join(f'"{column}"' for column in selected)
+    query = f'SELECT {selected_columns} FROM "{table}"'
     cursor = connection.execute(query)
     while True:
         rows = cursor.fetchmany(100_000)
@@ -533,8 +540,11 @@ def load_temporal_table(
         preserve_values: tuple[Any, ...] = ()
         if preserve_columns:
             where = " AND ".join(f'"{name}" = ?' for name in key_columns)
+            selected_preserve_columns = ", ".join(
+                f'"{name}"' for name in preserve_columns
+            )
             preserve_query = (
-                f'SELECT {", ".join(f"""\"{name}\"""" for name in preserve_columns)} '
+                f"SELECT {selected_preserve_columns} "
                 f'FROM "{table}" WHERE {where} LIMIT 1'
             )
             preserve_row = connection.execute(preserve_query, tuple(key)).fetchone()
@@ -780,6 +790,7 @@ def run_tsam(
 
 
 def run_pyomo(
+    database: Path,
     profiles: pd.DataFrame,
     selected_columns: list[str],
     column_weights: dict[str, float],
@@ -838,6 +849,7 @@ def run_pyomo(
 
     if extreme_records is None:
         extreme_records = build_extreme_audit_records(
+            database=database,
             profiles=profiles,
             selected_columns=selected_columns,
             metadata=metadata,
@@ -1021,6 +1033,7 @@ def run_pyomo(
 
 
 def build_extreme_audit_records(
+    database: Path,
     profiles: pd.DataFrame,
     selected_columns: list[str],
     metadata: dict[str, ProfileMetadata],
@@ -1268,6 +1281,28 @@ def build_extreme_audit_records(
                 )
             )
 
+    net_load_config = extreme_config.get(
+        "include_max_net_load_ramp_day", {}
+    )
+    if is_pyomo and ramp_rule_enabled(net_load_config):
+        if not isinstance(net_load_config, dict):
+            raise ValueError(
+                "include_max_net_load_ramp_day must be a YAML mapping."
+            )
+        records.extend(
+            build_net_load_ramp_records(
+                database=database,
+                profiles=profiles,
+                selected_columns=selected_columns,
+                metadata=metadata,
+                seasons=seasons,
+                hours=hours,
+                engine=engine,
+                selection_method=selection_method,
+                config=net_load_config,
+            )
+        )
+
     if is_pyomo:
         for day_id in pyomo_config.get("forced_day_ids", []):
             day_position = int(day_id) - 1
@@ -1411,6 +1446,353 @@ def calculate_ramps(daily_values: np.ndarray, direction: str) -> np.ndarray:
     if direction == "upward":
         return changes
     return -changes
+
+
+def build_net_load_ramp_records(
+    database: Path,
+    profiles: pd.DataFrame,
+    selected_columns: list[str],
+    metadata: dict[str, ProfileMetadata],
+    seasons: list[str],
+    hours: list[str],
+    engine: str,
+    selection_method: str,
+    config: dict[str, Any],
+) -> list[dict[str, Any]]:
+    direction = str(config.get("direction", "absolute")).lower()
+    if direction not in {"absolute", "upward", "downward"}:
+        raise ValueError(
+            "include_max_net_load_ramp_day.direction must be absolute, "
+            "upward, or downward."
+        )
+    demand_config = config.get("demand", {})
+    generation_config = config.get("existing_generation", {})
+    demand_profile_table = demand_config.get(
+        "profile_table", "DemandSpecificDistribution"
+    )
+    demand_commodity = str(demand_config.get("commodity", "D_ELEC"))
+    demand_columns = [
+        column
+        for column, item in metadata.items()
+        if item.table == demand_profile_table
+        and str(profile_key(item, "demand_name")) == demand_commodity
+    ]
+    if not demand_columns:
+        raise ValueError(
+            f"No {demand_profile_table} profiles were found for demand "
+            f"commodity {demand_commodity}."
+        )
+    available_periods = sorted(
+        {
+            profile_key(metadata[column], "periods")
+            for column in demand_columns
+            if profile_key(metadata[column], "periods") not in {None, ""}
+        },
+        key=lambda value: int(value),
+    )
+    reference_period = resolve_reference_period(
+        config.get("reference_period", "first_model_period"),
+        available_periods,
+        "net-load ramp",
+    )
+    available_regions = sorted(
+        {
+            str(profile_key(metadata[column], "regions"))
+            for column in demand_columns
+            if str(profile_key(metadata[column], "periods"))
+            == str(reference_period)
+        }
+    )
+    configured_regions = config.get("regions", "all")
+    if configured_regions == "all":
+        regions = available_regions
+    elif isinstance(configured_regions, list):
+        regions = [str(region) for region in configured_regions]
+    else:
+        raise ValueError(
+            "include_max_net_load_ramp_day.regions must be all or a list."
+        )
+    missing_regions = sorted(set(regions) - set(available_regions))
+    if missing_regions:
+        raise ValueError(
+            "Net-load-ramp regions were not found in the configured demand "
+            f"profiles: {missing_regions}"
+        )
+
+    technologies = parse_generation_technologies(generation_config)
+    if not technologies:
+        raise ValueError(
+            "include_max_net_load_ramp_day.existing_generation.technologies "
+            "must contain at least one technology."
+        )
+    segfrac = load_hourly_segfrac(
+        database, demand_config.get("segfrac", {}), seasons, hours
+    )
+    calendar_hours = len(seasons) * len(hours)
+    records: list[dict[str, Any]] = []
+    with sqlite3.connect(
+        f"file:{database.resolve()}?mode=ro", uri=True
+    ) as connection:
+        for region in regions:
+            matching_demand_columns = [
+                column
+                for column in demand_columns
+                if str(profile_key(metadata[column], "regions")) == region
+                and str(profile_key(metadata[column], "periods"))
+                == str(reference_period)
+            ]
+            if len(matching_demand_columns) != 1:
+                raise ValueError(
+                    "Net-load ramp requires exactly one DSD profile for "
+                    f"region={region}, period={reference_period}, "
+                    f"commodity={demand_commodity}; found "
+                    f"{len(matching_demand_columns)}."
+                )
+            demand_column = matching_demand_columns[0]
+            annual_energy_gwh = load_annual_demand_gwh(
+                connection,
+                demand_config,
+                region,
+                reference_period,
+                demand_commodity,
+            )
+            demand_gw = (
+                annual_energy_gwh
+                * profiles[demand_column].to_numpy(dtype=float)
+                / (segfrac * calendar_hours)
+            )
+            generation_gw = np.zeros(len(profiles), dtype=float)
+            generation_profiles: list[str] = []
+            technology_labels: list[str] = []
+            for technology in technologies:
+                technology_name = technology["tech"]
+                capacity_gw = load_existing_capacity_gw(
+                    connection,
+                    generation_config,
+                    region,
+                    technology_name,
+                )
+                if capacity_gw <= 0:
+                    continue
+                cf_table = technology.get(
+                    "capacity_factor_table",
+                    generation_config.get(
+                        "capacity_factor_table", "CapacityFactorTech"
+                    ),
+                )
+                cf_columns = [
+                    column
+                    for column, item in metadata.items()
+                    if item.table == cf_table
+                    and str(profile_key(item, "regions")) == region
+                    and str(profile_key(item, "tech")) == technology_name
+                ]
+                if len(cf_columns) != 1:
+                    raise ValueError(
+                        "Expected exactly one capacity-factor profile for "
+                        f"region={region}, technology={technology_name}, "
+                        f"table={cf_table}; found {len(cf_columns)}."
+                    )
+                cf_column = cf_columns[0]
+                generation_gw += (
+                    capacity_gw
+                    * profiles[cf_column].to_numpy(dtype=float)
+                )
+                generation_profiles.append(cf_column)
+                technology_labels.append(technology_name)
+
+            net_load_gw = demand_gw - generation_gw
+            daily_net_load = net_load_gw.reshape(len(seasons), len(hours))
+            ramp_values = calculate_ramps(daily_net_load, direction)
+            day_position = int(np.argmax(ramp_values.max(axis=1)))
+            ramp_position = int(np.argmax(ramp_values[day_position]))
+            before = day_position * len(hours) + ramp_position
+            after = before + 1
+            record = extreme_record(
+                engine=engine,
+                selection_method=selection_method,
+                rule="include_max_net_load_ramp_day",
+                profile="<actual demand - available existing generation>",
+                metadata=None,
+                day_position=day_position,
+                seasons=seasons,
+                hour=f"{hours[ramp_position]}->{hours[ramp_position + 1]}",
+                metric_value=float(ramp_values[day_position, ramp_position]),
+                profile_in_clustering=(
+                    demand_column in selected_columns
+                    and all(
+                        column in selected_columns
+                        for column in generation_profiles
+                    )
+                ),
+                table=(
+                    f"{demand_profile_table} + ExistingCapacity + "
+                    "CapacityFactor"
+                ),
+                profile_count=1 + len(generation_profiles),
+                regions=region,
+                periods=reference_period,
+                demand_name=demand_commodity,
+                tech=" | ".join(technology_labels),
+            )
+            record.update(
+                {
+                    "ramp_direction": direction,
+                    "metric_unit": "GW",
+                    "demand_before_gw": float(demand_gw[before]),
+                    "demand_after_gw": float(demand_gw[after]),
+                    "generation_before_gw": float(generation_gw[before]),
+                    "generation_after_gw": float(generation_gw[after]),
+                    "net_load_before_gw": float(net_load_gw[before]),
+                    "net_load_after_gw": float(net_load_gw[after]),
+                }
+            )
+            records.append(record)
+    return records
+
+
+def parse_generation_technologies(config: dict[str, Any]) -> list[dict[str, str]]:
+    parsed = []
+    for item in config.get("technologies", []):
+        if isinstance(item, str):
+            parsed.append({"tech": item})
+        elif isinstance(item, dict) and item.get("tech"):
+            parsed.append({key: str(value) for key, value in item.items()})
+        else:
+            raise ValueError(
+                "Each existing_generation technology must be a technology "
+                "name or a mapping containing tech."
+            )
+    return parsed
+
+
+def load_hourly_segfrac(
+    database: Path,
+    config: dict[str, Any],
+    seasons: list[str],
+    hours: list[str],
+) -> np.ndarray:
+    mode = config.get("mode", "database")
+    if mode == "uniform_full_year":
+        return np.full(
+            len(seasons) * len(hours),
+            1.0 / (len(seasons) * len(hours)),
+        )
+    if mode != "database":
+        raise ValueError(
+            "Net-load demand.segfrac.mode must be database or "
+            "uniform_full_year."
+        )
+    table = config.get("table", "SegFrac")
+    season_column = config.get("season_column", "season_name")
+    hour_column = config.get("hour_column", "time_of_day_name")
+    value_column = config.get("value_column", "segfrac")
+    values = np.full(len(seasons) * len(hours), np.nan)
+    season_positions = {season: position for position, season in enumerate(seasons)}
+    hour_positions = {hour: position for position, hour in enumerate(hours)}
+    with sqlite3.connect(
+        f"file:{database.resolve()}?mode=ro", uri=True
+    ) as connection:
+        mapping = build_season_mapping(
+            connection, table, season_column, seasons
+        )
+        rows = connection.execute(
+            f'SELECT "{season_column}", "{hour_column}", "{value_column}" '
+            f'FROM "{table}"'
+        )
+        for raw_season, hour, value in rows:
+            season = mapping.get(raw_season)
+            if season not in season_positions or hour not in hour_positions:
+                continue
+            position = (
+                season_positions[season] * len(hours) + hour_positions[hour]
+            )
+            values[position] = float(value)
+    if np.isnan(values).any() or np.any(values <= 0):
+        raise ValueError(
+            "Net-load ramp requires one positive SegFrac value for every hour."
+        )
+    if not np.isclose(values.sum(), 1.0, atol=1e-8):
+        raise ValueError(
+            f"Net-load ramp requires SegFrac to sum to 1; found {values.sum()}."
+        )
+    return values
+
+
+def load_annual_demand_gwh(
+    connection: sqlite3.Connection,
+    config: dict[str, Any],
+    region: str,
+    period: Any,
+    commodity: str,
+) -> float:
+    table = config.get("annual_table", "Demand")
+    region_column = config.get("region_column", "regions")
+    period_column = config.get("period_column", "periods")
+    commodity_column = config.get("commodity_column", "demand_comm")
+    value_column = config.get("value_column", "demand")
+    unit_column = config.get("unit_column", "demand_units")
+    rows = connection.execute(
+        f'SELECT "{value_column}", "{unit_column}" FROM "{table}" '
+        f'WHERE "{region_column}" = ? AND "{period_column}" = ? '
+        f'AND "{commodity_column}" = ?',
+        (region, period, commodity),
+    ).fetchall()
+    if len(rows) != 1:
+        raise ValueError(
+            f"Expected one annual demand row for region={region}, "
+            f"period={period}, commodity={commodity}; found {len(rows)}."
+        )
+    value, unit = rows[0]
+    return energy_to_gwh(float(value), str(unit))
+
+
+def energy_to_gwh(value: float, unit: str) -> float:
+    factors = {
+        "PJ": 1_000_000 / 3_600,
+        "TWH": 1_000.0,
+        "GWH": 1.0,
+        "MWH": 0.001,
+    }
+    normalized = normalize_unit(unit)
+    if normalized not in factors:
+        raise ValueError(
+            f"Unsupported annual demand unit {unit!r}; use PJ, TWh, GWh, or MWh."
+        )
+    return value * factors[normalized]
+
+
+def load_existing_capacity_gw(
+    connection: sqlite3.Connection,
+    config: dict[str, Any],
+    region: str,
+    technology: str,
+) -> float:
+    table = config.get("capacity_table", "ExistingCapacity")
+    region_column = config.get("region_column", "regions")
+    tech_column = config.get("tech_column", "tech")
+    value_column = config.get("value_column", "exist_cap")
+    unit_column = config.get("unit_column", "exist_cap_units")
+    rows = connection.execute(
+        f'SELECT "{value_column}", "{unit_column}" FROM "{table}" '
+        f'WHERE "{region_column}" = ? AND "{tech_column}" = ?',
+        (region, technology),
+    ).fetchall()
+    return sum(capacity_to_gw(float(value), str(unit)) for value, unit in rows)
+
+
+def capacity_to_gw(value: float, unit: str) -> float:
+    factors = {"GW": 1.0, "MW": 0.001, "KW": 0.000001}
+    normalized = normalize_unit(unit)
+    if normalized not in factors:
+        raise ValueError(
+            f"Unsupported existing-capacity unit {unit!r}; use GW, MW, or kW."
+        )
+    return value * factors[normalized]
+
+
+def normalize_unit(unit: str) -> str:
+    return unit.strip().upper().replace("(", "").replace(")", "").strip()
 
 
 def build_pyomo_representatives(
@@ -1842,6 +2224,14 @@ def write_audits(
         "source_day",
         "hour",
         "metric_value",
+        "metric_unit",
+        "ramp_direction",
+        "demand_before_gw",
+        "demand_after_gw",
+        "generation_before_gw",
+        "generation_after_gw",
+        "net_load_before_gw",
+        "net_load_after_gw",
         "profile_in_clustering",
         "profile_count",
     ]

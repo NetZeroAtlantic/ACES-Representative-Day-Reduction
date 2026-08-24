@@ -15,7 +15,7 @@
 # - Output representation: medoid (complete historical days).
 # - Normal clusters requested: 15.
 # - Extreme method: new_cluster.
-# - Configured extremes: four regional peak-demand days and one NS low-wind day.
+# - Configured extremes: profile extremes plus regional demand and net-load ramps.
 # - Final TSAM count can exceed 15 because new_cluster adds extreme clusters.
 
 project:
@@ -227,6 +227,62 @@ clustering:
       # Recommended for sustained low-wind selection.
       min_period:
         - "CapacityFactorTech|NS|E_WIND-ON_EX"
+
+      # CUSTOM ACES RAMP EXTREMES
+      # The runner calculates these dates before TSAM. It creates internal marker
+      # profiles so TSAM includes the complete historical days through the method
+      # selected above. Internal markers are removed from the ACES output.
+      # If several regions select the same date, TSAM receives that date once and
+      # the audit retains every regional reason.
+      custom_marker_weight: 1.0e-6
+
+      include_max_daily_ramp_day:
+        enabled: true
+        reference_period: first_model_period
+        regions: all  # Or a subset such as [NL, NS, NB, PEI].
+        direction: absolute  # absolute, upward, or downward.
+
+      include_max_net_load_ramp_day:
+        enabled: true
+        reference_period: first_model_period
+        regions: all
+        direction: absolute  # absolute, upward, or downward.
+
+        demand:
+          annual_table: Demand
+          region_column: regions
+          period_column: periods
+          commodity_column: demand_comm
+          value_column: demand
+          unit_column: demand_units
+          commodity: D_ELEC
+          profile_table: DemandSpecificDistribution
+
+          segfrac:
+            # Use uniform_full_year for an hourly source year. Use database only
+            # when SegFrac has one positive row per source hour and sums to one.
+            mode: uniform_full_year
+            table: SegFrac
+            season_column: season_name
+            hour_column: time_of_day_name
+            value_column: segfrac
+
+        existing_generation:
+          # All ExistingCapacity vintages are summed by region and technology.
+          capacity_table: ExistingCapacity
+          region_column: regions
+          tech_column: tech
+          value_column: exist_cap
+          unit_column: exist_cap_units
+          capacity_factor_table: CapacityFactorTech
+
+          # Add every existing variable-generation technology to include.
+          # Regions without capacity for a listed technology contribute zero.
+          technologies:
+            - tech: E_WIND-ON_EX
+              capacity_factor_table: CapacityFactorTech
+            # - tech: YOUR_EXISTING_SOLAR_TECH
+            #   capacity_factor_table: CapacityFactorTech
 
     segmentation:
       # Keep false to retain H00-H23. If enabled, n_segments must remain 24 in

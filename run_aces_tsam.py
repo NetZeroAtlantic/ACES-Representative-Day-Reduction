@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import shutil
 import sqlite3
 from dataclasses import dataclass
@@ -113,21 +114,54 @@ def main() -> None:
         engine=engine,
     )
     if engine == "tsam":
-        result = run_tsam(
+        custom_ramp_rules = {
+            "include_max_daily_ramp_day",
+            "include_max_net_load_ramp_day",
+        }
+        custom_forced_day_ids = sorted(
+            {
+                int(record["day_id"])
+                for record in extreme_records
+                if record.get("rule") in custom_ramp_rules
+            }
+        )
+        tsam_profiles, tsam_weights, marker_columns = add_tsam_day_markers(
             profiles[selected_columns],
             column_weights,
-            config["clustering"],
+            custom_forced_day_ids,
+            len(hours),
+            float(
+                config["clustering"]
+                .get("tsam", {})
+                .get("extremes", {})
+                .get("custom_marker_weight", 1e-6)
+            ),
         )
-        all_result = result.clustering.apply(profiles)
-        representatives = all_result.cluster_representatives
-        cluster_weights = all_result.cluster_weights
+        result = run_tsam(
+            tsam_profiles,
+            tsam_weights,
+            config["clustering"],
+            marker_columns,
+        )
+        transfer_profiles = profiles.join(tsam_profiles[marker_columns])
+        all_result = result.clustering.apply(transfer_profiles)
+        representatives = all_result.cluster_representatives.drop(
+            columns=marker_columns
+        )
+        cluster_weights = get_tsam_cluster_weights(all_result)
         representative_source_days = map_representative_source_days(
             representatives,
             result.clustering.cluster_centers,
             seasons,
         )
         cluster_assignments = list(all_result.clustering.cluster_assignments)
-        accuracy = all_result.accuracy
+        accuracy = AccuracySummary(
+            rmse=all_result.accuracy.rmse.reindex(profiles.columns),
+            mae=all_result.accuracy.mae.reindex(profiles.columns),
+            rmse_duration=all_result.accuracy.rmse_duration.reindex(
+                profiles.columns
+            ),
+        )
         forced_day_ids = sorted(
             {int(record["day_id"]) for record in extreme_records}
         )
@@ -674,10 +708,57 @@ def select_clustering_columns(
     return selected, weights
 
 
+def add_tsam_day_markers(
+    profiles: pd.DataFrame,
+    column_weights: dict[str, float],
+    forced_day_ids: list[int],
+    hours_per_day: int,
+    marker_weight: float,
+) -> tuple[pd.DataFrame, dict[str, float], list[str]]:
+    if not forced_day_ids:
+        return profiles, dict(column_weights), []
+    if marker_weight <= 0:
+        raise ValueError("tsam.extremes.custom_marker_weight must be positive.")
+    if len(profiles) % hours_per_day != 0:
+        raise ValueError("TSAM custom extreme markers require complete days.")
+    n_days = len(profiles) // hours_per_day
+    invalid = [
+        day_id for day_id in forced_day_ids if day_id < 1 or day_id > n_days
+    ]
+    if invalid:
+        raise ValueError(f"Invalid TSAM custom extreme day IDs: {invalid}")
+
+    augmented = profiles.copy()
+    weights = dict(column_weights)
+    marker_columns = []
+    for day_id in sorted(set(forced_day_ids)):
+        column = f"__ACES_FORCED_DAY_{day_id:04d}"
+        values = np.zeros(len(augmented), dtype=float)
+        start = (day_id - 1) * hours_per_day
+        values[start : start + hours_per_day] = 1.0
+        augmented[column] = values
+        weights[column] = marker_weight
+        marker_columns.append(column)
+    return augmented, weights, marker_columns
+
+
+def get_tsam_cluster_weights(result: Any) -> dict[int, float]:
+    raw_weights = getattr(result, "cluster_weights", None)
+    if raw_weights is None:
+        raw_weights = getattr(result, "cluster_counts", None)
+    if raw_weights is None:
+        raise ValueError("TSAM result does not provide cluster weights/counts.")
+    return {
+        int(cluster): float(weight)
+        for cluster, weight in dict(raw_weights).items()
+    }
+
+
 def run_tsam(
     profiles: pd.DataFrame,
     column_weights: dict[str, float],
     clustering: dict[str, Any],
+    custom_extreme_columns: list[str] | None = None,
 ):
     try:
         import tsam
@@ -714,25 +795,41 @@ def run_tsam(
                 f"Excluded {len(constant_columns)} constant profiles from "
                 "distance calculations; they remain in the output database."
             )
-    cluster = ClusterConfig(
-        method=cluster_data["method"],
-        representation=build_representation(
+    cluster_options = {
+        "method": cluster_data["method"],
+        "representation": build_representation(
             cluster_data.get("representation"), Distribution, MinMaxMean
         ),
-        normalize_column_means=bool(
-            cluster_data.get("normalize_column_means", False)
+        "use_duration_curves": bool(
+            cluster_data.get("use_duration_curves", False)
         ),
-        use_duration_curves=bool(cluster_data.get("use_duration_curves", False)),
-        include_period_sums=bool(cluster_data.get("include_period_sums", False)),
-        solver=cluster_data.get("solver", "highs"),
+        "include_period_sums": bool(
+            cluster_data.get("include_period_sums", False)
+        ),
+        "solver": cluster_data.get("solver", "highs"),
+    }
+    normalize_means = bool(
+        cluster_data.get("normalize_column_means", False)
     )
+    cluster_parameters = inspect.signature(ClusterConfig).parameters
+    if "scale_by_column_means" in cluster_parameters:
+        cluster_options["scale_by_column_means"] = normalize_means
+    else:
+        cluster_options["normalize_column_means"] = normalize_means
+    cluster = ClusterConfig(**cluster_options)
     extreme_data = tsam_config.get("extremes", {})
     extremes = None
-    if extreme_data.get("enabled", False):
+    custom_extreme_columns = custom_extreme_columns or []
+    if extreme_data.get("enabled", False) or custom_extreme_columns:
         extreme_columns = {
             key: extreme_data.get(key, [])
             for key in ("max_value", "min_value", "max_period", "min_period")
         }
+        extreme_columns["max_value"] = list(
+            dict.fromkeys(
+                list(extreme_columns["max_value"]) + custom_extreme_columns
+            )
+        )
         missing = sorted(
             {
                 column
@@ -1190,7 +1287,7 @@ def build_extreme_audit_records(
             )
 
     ramp_config = extreme_config.get("include_max_daily_ramp_day", False)
-    if is_pyomo and ramp_rule_enabled(ramp_config):
+    if ramp_rule_enabled(ramp_config):
         ramp_options = ramp_config if isinstance(ramp_config, dict) else {}
         direction = str(ramp_options.get("direction", "absolute")).lower()
         if direction not in {"absolute", "upward", "downward"}:
@@ -1284,7 +1381,7 @@ def build_extreme_audit_records(
     net_load_config = extreme_config.get(
         "include_max_net_load_ramp_day", {}
     )
-    if is_pyomo and ramp_rule_enabled(net_load_config):
+    if ramp_rule_enabled(net_load_config):
         if not isinstance(net_load_config, dict):
             raise ValueError(
                 "include_max_net_load_ramp_day must be a YAML mapping."

@@ -143,6 +143,10 @@ For exact historical medoid values, keep `aggregate.preserve_column_means: false
 | `min_value` | Day containing the smallest hourly value. Example: minimum temperature. |
 | `max_period` | Day with the largest 24-hour total. |
 | `min_period` | Day with the smallest 24-hour total. Example: sustained low wind. |
+| `include_max_daily_ramp_day` | One regional demand-shape ramp day for every configured region. Supports absolute, upward, or downward ramps. |
+| `include_max_net_load_ramp_day` | One regional actual-demand minus available-existing-generation ramp day for every configured region. |
+
+The first four rules are native TSAM profile extremes. The two ramp rules are calculated by the ACES runner before clustering. The runner gives each unique calculated date a temporary tiny-weight marker profile, passes those markers through TSAM `max_value`, and removes the markers before writing ACES tables or audit accuracy. If several regions or rules identify the same date, TSAM receives it once and every reason remains in `extreme_day_provenance.csv`.
 
 The ACES runner supports two TSAM extreme methods:
 
@@ -152,6 +156,8 @@ The ACES runner supports two TSAM extreme methods:
 | `new_cluster` | Adds each unique extreme as a new center and allows similar days to join it. Final count can exceed `n_representative_days`, and the extreme cluster can have weight greater than 1. |
 
 `replace` is not supported. TSAM can create a hybrid representative in which only the targeted profile comes from the extreme day. That replacement is not retained when the clustering is applied to the complete ACES profile set. The runner stops with a validation error if `replace` is selected.
+
+Both custom ramp rules therefore use the selected TSAM `append` or `new_cluster` method. With `append`, each calculated date normally receives weight 1. With `new_cluster`, similar historical days may join it and increase its occurrence weight.
 
 If 15 normal days and five unique extreme days are configured, `append` or `new_cluster` can produce up to 20 representative days.
 

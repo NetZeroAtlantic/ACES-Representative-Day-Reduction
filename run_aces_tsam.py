@@ -212,6 +212,63 @@ def validate_clustering_settings(
             "complete ACES days."
         )
     if engine == "tsam":
+        tsam_config = clustering.get("tsam")
+        if not isinstance(tsam_config, dict):
+            raise ValueError("Missing clustering.tsam configuration.")
+        if int(tsam_config.get("period_duration", 24)) != 24:
+            raise ValueError(
+                "The ACES database writer requires tsam.period_duration: 24."
+            )
+        cluster_config = tsam_config.get("cluster", {})
+        allowed_methods = {
+            "hierarchical",
+            "kmeans",
+            "kmedoids",
+            "kmaxoids",
+            "averaging",
+            "contiguous",
+        }
+        if cluster_config.get("method") not in allowed_methods:
+            raise ValueError(
+                "clustering.tsam.cluster.method must be hierarchical, kmeans, "
+                "kmedoids, kmaxoids, averaging, or contiguous."
+            )
+        representation = cluster_config.get("representation", "medoid")
+        representation_type = (
+            representation.get("type", "medoid")
+            if isinstance(representation, dict)
+            else representation
+        )
+        if representation_type != "medoid":
+            raise ValueError(
+                "The ACES source-day writer requires TSAM representation.type: "
+                "medoid. Synthetic representations such as mean or distribution "
+                "cannot be labeled as one historical source day."
+            )
+        extremes = tsam_config.get("extremes", {})
+        if extremes.get("enabled", False) and extremes.get(
+            "method", "append"
+        ) == "replace":
+            raise ValueError(
+                "TSAM extremes.method: replace is not supported by the ACES "
+                "profile-transfer workflow. Use append or new_cluster."
+            )
+        segmentation = tsam_config.get("segmentation", {})
+        if segmentation.get("enabled", False) and int(
+            segmentation.get("n_segments", 24)
+        ) != 24:
+            raise ValueError(
+                "The ACES database writer requires 24 TSAM segments (H00-H23)."
+            )
+        if bool(
+            tsam_config.get("aggregate", {}).get(
+                "preserve_column_means", False
+            )
+        ):
+            raise ValueError(
+                "Use tsam.aggregate.preserve_column_means: false with medoid "
+                "output so representative profiles remain exact historical days."
+            )
         build_extreme_audit_records(
             profiles=profiles,
             selected_columns=selected_columns,
@@ -259,6 +316,46 @@ def validate_clustering_settings(
             )
         if int(pyomo_config.get("n_random_iterations", 50)) < 1:
             raise ValueError("n_random_iterations must be at least 1.")
+    elif pyomo_config.get("sampled_candidate_pool_size") is not None:
+        raise ValueError(
+            "sampled_candidate_pool_size is used only by "
+            "hybrid_random_weighting; set it to null for solution_method: opt."
+        )
+
+    candidate_method = pyomo_config.get("candidate_reduction_method", "none")
+    allowed_candidate_methods = {
+        "none",
+        "kmeans_nearest_day",
+        "ward_nearest_day",
+        "extreme_plus_kmeans",
+        "extreme_plus_ward",
+    }
+    if candidate_method not in allowed_candidate_methods:
+        raise ValueError(
+            "Unsupported clustering.pyomo.candidate_reduction_method."
+        )
+    candidate_count = pyomo_config.get("n_candidate_days")
+    if candidate_method != "none":
+        if candidate_count is None:
+            raise ValueError(
+                "n_candidate_days is required when Pyomo candidate reduction "
+                "is enabled."
+            )
+        if not n_representative_days <= int(candidate_count) <= len(seasons):
+            raise ValueError(
+                "n_candidate_days must be between n_representative_days and "
+                "the number of original days."
+            )
+    feature_mode = pyomo_config.get(
+        "candidate_feature_mode", "chronological_daily_profile"
+    )
+    if feature_mode not in {
+        "chronological_daily_profile",
+        "daily_duration_curve",
+        "hybrid_profile_and_duration",
+        "summary_statistics",
+    }:
+        raise ValueError("Unsupported clustering.pyomo.candidate_feature_mode.")
 
     extreme_records = build_extreme_audit_records(
         profiles=profiles,

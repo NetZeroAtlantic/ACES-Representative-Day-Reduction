@@ -1,471 +1,370 @@
-# ACES 8760 -> representative-day ACES database
-# Edit values after ":". Text after "#" is an explanation and is ignored by YAML.
+# ACES full-year database -> weighted representative-day database
 #
-# EXECUTION FLOW:
-# 1. Read the ACES temporal tables configured below.
-# 2. Convert every region/technology/demand combination into a 366-day profile.
-# 3. Keep only profiles listed under clustering.attributes.include.
-# 4. Apply the table/column weights when comparing days.
-# 5. Run only the engine selected by clustering.engine.
-# 6. Build representative 24-hour profiles and occurrence weights.
-# 7. Write a copied ACES database using selected source dates and weighted SegFrac rows.
+# EDITING ORDER
+# 1. Set project.input_database and project.output_database.
+# 2. Select clustering.engine: tsam or pyomo.
+# 3. Set clustering.n_representative_days.
+# 4. Select the ACES tables and profile weights under clustering.attributes.
+# 5. Edit only the block for the selected engine.
+# 6. Run validation before the full reduction:
+#      python run_aces_tsam.py aces_tsam_8760.yaml --validate-only
 #
-# CURRENT SETTINGS SUMMARY:
-# - Engine: duration-curve exceedance-error minimization modeled with Pyomo.
-# - Method: hybrid random historical-day selection followed by optimized weights.
-# - Weight model: continuous linear optimization using HiGHS.
-# - Random trials: 10 reproducible selections for an initial end-to-end test.
-# - Requested count: exactly 15 representative days, including forced extremes.
-# - Included inputs: DSD, CapacityFactorTech, CapacityFactorProcess.
-# - Extremes: four regional 2025 peak-demand days and one sustained low-wind day.
-# - Output profiles: actual historical days, not synthetic profiles.
+# ACTIVE RUN
+# - Engine: TSAM.
+# - Clustering method: kmedoids.
+# - Output representation: medoid (complete historical days).
+# - Normal clusters requested: 15.
+# - Extreme method: new_cluster.
+# - Configured extremes: four regional peak-demand days and one NS low-wind day.
+# - Final TSAM count can exceed 15 because new_cluster adds extreme clusters.
 
 project:
-  input_database: data/Offshore_wind_NS-NB.sqlite  # Original ACES database containing the hourly tables. This file is never overwritten.
-  output_database: output/Offshore_wind_NS-NB_repdays_actual_dates.sqlite  # Reduced database whose representative seasons are actual selected dates.
-  # null makes the runner copy the input database as its schema/static-data template,
-  # so a fresh GitHub clone does not depend on an untracked file in output/.
-  # Advanced local option: output/Offshore_wind_NS-NB_repdays.sqlite can reduce copy time.
-  output_template_database: null
-  extra_attributes_directory: extra_attributes  # Folder for optional timestamped CSV/XLSX data such as temperature or humidity.
-  overwrite_output: true  # true = replace the previous reduced database when testing again; the original input is never changed.
-  compact_output: true  # Run SQLite VACUUM so deleted 8760 rows no longer occupy space in the reduced database.
+  # Put the full-year SQLite database in data/ and set its path here.
+  # The input file is opened read-only and is never modified.
+  input_database: data/Offshore_wind_NS-NB.sqlite
 
+  # The reduced database and audits are written under output/.
+  output_database: output/Offshore_wind_NS-NB_repdays_actual_dates.sqlite
+
+  # null copies the input database before replacing its temporal rows.
+  # A local compact template can be supplied to reduce copying time, but that
+  # template must have the same ACES schema and static data as the input.
+  output_template_database: null
+
+  # Optional CSV/XLSX files containing temperature, humidity, or other hourly data.
+  extra_attributes_directory: extra_attributes
+
+  # true replaces an older output with the same name. It never replaces the input.
+  overwrite_output: true
+
+  # VACUUM removes deleted full-year rows from the completed output file.
+  compact_output: true
+
+# ACES SCHEMA MAPPING
+# Change this section only when the input database uses different table or column names.
 aces:
   calendar:
-    season_table: time_season  # ACES table containing the original day/date labels.
-    season_column: t_season  # Date-label column in time_season.
-    season_format: "%m-%d"  # Input date format. Example: 01-31 means January 31.
-    # Some imported tables may contain 13-01 instead of 01-13. The runner safely
-    # swaps only labels absent from time_season when the swapped label exists.
-    base_year: 2024  # Year assigned to month-day labels; 2024 contains 366 days.
-    hour_table: time_of_day  # ACES table containing H00-H23.
-    hour_column: t_day  # Hour-label column in time_of_day.
-    hour_format: "H%H"  # Input hour format. Example: H07 means 07:00.
-    hours_per_day: 24  # Number of hourly rows required for each day.
+    season_table: time_season
+    season_column: t_season
+    season_format: "%m-%d"
+    base_year: 2024
+    hour_table: time_of_day
+    hour_column: t_day
+    hours_per_day: 24
 
   weights:
-    table: SegFrac  # ACES table where representative-day occurrence weights are encoded.
-    season_column: season_name  # Representative-day column in SegFrac.
-    hour_column: time_of_day_name  # Hour column in SegFrac.
-    value_column: segfrac  # Fraction-of-year value used by ACES.
-    notes_column: segfrac_notes  # Optional provenance/explanation column.
-    formula: representative_day_weight/(original_day_count*24)  # Example: weight 30 with 366 days gives 30/(366*24) per hour.
-    create_audit_table: true  # Creates a simple table showing each representative day and its raw day weight.
-    audit_table: RepresentativeDayWeight  # Name of the audit table added to the output database.
+    table: SegFrac
+    season_column: season_name
+    hour_column: time_of_day_name
+    value_column: segfrac
+    notes_column: segfrac_notes
+    create_audit_table: true
+    audit_table: RepresentativeDayWeight
 
   temporal_tables:
-    - table: DemandSpecificDistribution  # Hourly ACES demand distribution (DSD).
-      enabled: true  # true = aggregate and rewrite this table; false = do not process it.
-      season_column: season_name  # Day/date column.
-      hour_column: time_of_day_name  # Hour column.
-      value_column: dsd  # Numeric demand-distribution value.
-      key_columns: [regions, periods, demand_name]  # Columns defining one independent demand profile.
-      preserve_columns: [dsd_notes]  # Metadata copied to the reduced rows.
-      output_rule: weighted_and_normalized_to_one  # Multiply by day weight, then ensure each demand profile sums to 1.
+    # Each key_columns combination becomes one independent hourly profile.
+    # Empty optional tables are skipped when validation.fail_on_missing_temporal_table is false.
+    - table: DemandSpecificDistribution
+      enabled: true
+      season_column: season_name
+      hour_column: time_of_day_name
+      value_column: dsd
+      key_columns: [regions, periods, demand_name]
+      preserve_columns: [dsd_notes]
+      # DSD values are weighted and normalized so every region/period/demand profile sums to 1.
+      output_rule: weighted_and_normalized_to_one
 
-    - table: CapacityFactorTech  # Hourly capacity factors indexed by technology.
-      enabled: true  # Include this table in clustering and output.
-      season_column: season_name  # Day/date column.
-      hour_column: time_of_day_name  # Hour column.
-      value_column: cf_tech  # Capacity-factor value.
-      key_columns: [regions, tech]  # One profile for each region/technology pair.
-      preserve_columns: [cf_tech_notes]  # Metadata copied to output.
-      output_rule: representative_profile  # Store the selected/generated representative hourly values without multiplying by weight.
+    - table: CapacityFactorTech
+      enabled: true
+      season_column: season_name
+      hour_column: time_of_day_name
+      value_column: cf_tech
+      key_columns: [regions, tech]
+      preserve_columns: [cf_tech_notes]
+      output_rule: representative_profile
 
-    - table: CapacityFactorProcess  # Hourly capacity factors indexed by technology and vintage.
-      enabled: true  # Include this table in clustering and output.
-      season_column: season_name  # Day/date column.
-      hour_column: time_of_day_name  # Hour column.
-      value_column: cf_process  # Process capacity-factor value.
-      key_columns: [regions, tech, vintage]  # One profile for each region/technology/vintage combination.
-      preserve_columns: [cf_process_notes]  # Metadata copied to output.
-      output_rule: representative_profile  # Weight is handled through SegFrac, not multiplied into CF.
+    - table: CapacityFactorProcess
+      enabled: true
+      season_column: season_name
+      hour_column: time_of_day_name
+      value_column: cf_process
+      key_columns: [regions, tech, vintage]
+      preserve_columns: [cf_process_notes]
+      output_rule: representative_profile
 
-    - table: EfficiencyVariable  # Optional time-varying efficiency table.
-      enabled: true  # Empty input tables are safely skipped when fail_on_missing_temporal_table is false.
-      season_column: season_name  # Day/date column.
-      hour_column: time_of_day_name  # Hour column.
-      value_column: efficiencyvar  # Time-varying efficiency.
-      key_columns: [regions, input_comm, tech, output_comm]  # Columns defining one efficiency profile.
-      preserve_columns: [source, eff_notes]  # Metadata copied to output.
-      output_rule: representative_profile  # Store representative efficiency values directly.
+    - table: EfficiencyVariable
+      enabled: true
+      season_column: season_name
+      hour_column: time_of_day_name
+      value_column: efficiencyvar
+      key_columns: [regions, input_comm, tech, output_comm]
+      preserve_columns: [source, eff_notes]
+      output_rule: representative_profile
 
-    - table: CostVariableVariable  # Time-varying price or variable-cost profiles.
-      enabled: true  # Include this table when it has complete hourly data.
-      season_column: season_name  # Day/date column.
-      hour_column: time_of_day_name  # Hour column.
-      value_column: costvarvar  # Numeric time-varying cost.
-      key_columns: [regions, tech]  # One profile for each region/technology pair.
-      preserve_columns: [source, eff_notes]  # Metadata copied to output.
-      output_rule: representative_profile  # Store representative costs; SegFrac supplies occurrence weight.
-
-  representative_day_labels:
-    mode: source_day  # Output labels use the selected historical date, such as 01-17, instead of R01.
+    - table: CostVariableVariable
+      enabled: true
+      season_column: season_name
+      hour_column: time_of_day_name
+      value_column: costvarvar
+      key_columns: [regions, tech]
+      preserve_columns: [source, eff_notes]
+      output_rule: representative_profile
 
 clustering:
-  # tsam = statistical clustering through TSAM.
-  # pyomo = minimize duration-curve exceedance error using a Pyomo model.
-  # Pyomo is the optimization framework; solution_method selects the actual
-  # representative-day search procedure.
-  # pyomo_milp = compatibility alias for pyomo + formulation: milp.
-  # pyomo_lp_fixed_days = compatibility alias for Pyomo weight optimization
-  # using an exact user-supplied fixed_day_ids list.
+  # ENGINE OPTIONS
+  # tsam  = cluster statistically similar days with TSAM.
+  # pyomo = select days and weights by minimizing binned duration-curve error.
+  # Only the selected engine block is used.
   engine: tsam
 
-  # Pyomo extremes are INCLUDED inside this count. For example, if this is 15
-  # and five unique extreme days are forced, Pyomo chooses those five plus ten
-  # additional days. TSAM can exceed this count when its extreme method is append.
+  # TSAM: number of normal clusters before append/new_cluster extremes are added.
+  # Pyomo: exact final number, including forced extreme days.
   n_representative_days: 15
 
+  # COMMON PROFILE SELECTION FOR BOTH ENGINES
   attributes:
-    # These weights affect DAY SELECTION only; they do not multiply ACES output values.
-    # A demand weight of 5.0 means demand-shape errors matter five times as much as
-    # an equal normalized error from a table with weight 1.0.
+    # A larger weight gives profiles from that table more influence on selection.
+    # Weights do not multiply values written to the reduced ACES database.
     table_default_weights:
-      DemandSpecificDistribution: 5.0  # Give demand strong influence. Example: increase to 5.0 to prioritize load shape.
-      CapacityFactorTech: 3.0  # Influence of technology-level wind/solar CF profiles.
-      CapacityFactorProcess: 1.0  # Influence of detailed technology/vintage CF profiles.
-      EfficiencyVariable: 0.0  # Influence of variable efficiency.
-      CostVariableVariable: 0.0  # Influence of time-varying prices/costs.
+      DemandSpecificDistribution: 5.0
+      CapacityFactorTech: 3.0
+      CapacityFactorProcess: 1.0
+      EfficiencyVariable: 0.0
+      CostVariableVariable: 0.0
 
     include:
-      tables:  # Only listed tables influence representative-day selection.
+      tables:
         - DemandSpecificDistribution
         - CapacityFactorTech
         - CapacityFactorProcess
-        #- EfficiencyVariable
-        #- CostVariableVariable
-      extra_attributes: []  # Extra file columns to include. Example: [temperature, humidity].
+        # - EfficiencyVariable
+        # - CostVariableVariable
+
+      # Column names loaded from files in extra_attributes/.
+      # Example: [temperature, humidity]
+      extra_attributes: []
 
     exclude:
-      regions: []  # Regions excluded from clustering. Example: [LAB, PEI].
-      technologies: []  # Technologies excluded from clustering. Example: [E_TRANS-USA].
-      demands: []  # Demand commodities excluded from clustering. Example: [D_HEAT].
-      columns: []  # Exact generated profile columns to exclude when needed.
+      regions: []       # Example: [LAB, PEI]
+      technologies: []  # Example: [E_TRANS-USA]
+      demands: []       # Example: [D_HEAT]
+      columns: []       # Exact generated profile names to exclude
 
-    column_weight_overrides: {}  # Override one profile's table weight. Example: {"DemandSpecificDistribution|NS|2025|D_ELEC": 6.0}.
+    # Override the table weight for exact profiles when required.
+    # Example:
+    # column_weight_overrides:
+    #   "DemandSpecificDistribution|NS|2025|D_ELEC": 8.0
+    column_weight_overrides: {}
 
+  # ============================================================================
+  # TSAM ENGINE
+  # Used only when clustering.engine: tsam
+  # ============================================================================
   tsam:
-    # This entire tsam block is used only when clustering.engine is tsam.
-    period_duration: 24  # Hours per clustered period; 24 creates representative days.
-    temporal_resolution: 1h  # Input time-step duration; use 1h for hourly ACES data.
+    # The ACES writer currently requires 24 one-hour values per representative day.
+    period_duration: 24
+    temporal_resolution: 1h
 
     cluster:
-      # Available methods:
-      # averaging = sequential groups; kmeans = fast centroids;
-      # kmedoids = real historical days selected through optimization;
-      # kmaxoids = deliberately dissimilar days;
-      # hierarchical = stable agglomerative clustering;
-      # contiguous = hierarchical clustering constrained by chronology.
-      # METHOD decides how the 366 original days are grouped:
-      # hierarchical = stable general-purpose grouping; good default.
-      # kmeans = fast grouping around average centers; centers are not real days.
-      # kmedoids = optimization that selects real historical days; uses solver below.
-      # kmaxoids = selects very different real days; emphasizes diversity/extremes.
-      # averaging = groups sequential periods; simple but normally less accurate.
-      # contiguous = only groups chronologically adjacent days.
-      method: kmedoids  # TSAM setting: selects representative historical days through optimization.
+      # METHOD OPTIONS
+      # hierarchical = stable general-purpose grouping; no solver required.
+      # kmeans       = fast grouping around calculated centers.
+      # kmedoids     = solver-based selection of central historical days.
+      # kmaxoids     = emphasizes dissimilar or outer days.
+      # averaging    = sequential blocks; does not group by profile similarity.
+      # contiguous   = hierarchical grouping restricted to neighboring dates.
+      method: kmedoids
 
+      # REQUIRED FOR THIS ACES WRITER
+      # medoid writes one complete historical day for each cluster.
+      # Synthetic TSAM representations (mean, distribution, distribution_minmax,
+      # minmax_mean, maxoid) are rejected because they cannot be labeled as one
+      # historical source day in the current database format.
       representation:
-        # mean = average profile; medoid = real closest day; maxoid = most dissimilar real day;
-        # distribution = preserves duration curve; distribution_minmax = also preserves extremes;
-        # minmax_mean = choose min/max/mean behavior by column.
-        # REPRESENTATION decides what profile is written for each completed cluster:
-        # mean = hourly average of all days in the cluster.
-        # medoid = one real historical day closest to the cluster center.
-        # distribution = synthetic profile preserving the cluster duration curve.
-        # distribution_minmax = distribution plus explicit minimum/maximum preservation.
-        # minmax_mean = choose maximum, minimum, or mean treatment by profile.
-        #
-        # Common combinations:
-        # hierarchical + medoid       -> grouped statistically, output real days.
-        # hierarchical + distribution -> grouped statistically, output synthetic profiles.
-        # kmedoids + medoid            -> optimized selection of real days.
-        type: medoid  # Every TSAM representative is one real historical day.
-        scope: cluster  # cluster = preserve each cluster distribution; global = preserve the full-year distribution.
-        preserve_minmax: true  # true preserves minimum and maximum values in distribution representation.
-        max_columns: []  # Used only by minmax_mean. Example: [peak_load_profile].
-        min_columns: []  # Used only by minmax_mean. Example: [wind_cf_profile].
+        type: medoid
 
-      normalize_column_means: true  # Scales profiles before distance calculation so large units do not dominate.
-      use_duration_curves: false  # true compares sorted values rather than hour-by-hour chronology.
-      include_period_sums: true  # true adds daily totals as clustering features, useful for energy/load preservation.
-      solver: cplex  # Used by kmedoids; HiGHS is installed automatically with TSAM. Hierarchical ignores this value.
+      # true reduces domination by profiles having larger numerical scales.
+      normalize_column_means: true
+
+      # false compares H00 with H00 through H23 with H23.
+      # true sorts each daily profile before comparison, preserving distribution
+      # but discarding the hour at which each value occurred.
+      use_duration_curves: false
+
+      # true includes each 24-hour total as an additional comparison feature.
+      include_period_sums: true
+
+      # Used only by kmedoids. Other TSAM methods ignore this solver setting.
+      solver: cplex
 
     extremes:
-      enabled: true  # false disables forced extreme periods completely.
+      enabled: true
 
-      # append = add extreme days after normal clustering; final count can exceed 12.
-      # replace = replace a normal representative; usually keeps the requested count.
-      # new_cluster = create an extreme cluster and give it an occurrence weight.
-      method: replace  # TSAM only: extreme days are added after normal clustering.
+      # SUPPORTED METHODS
+      # append      = add each extreme as a separate cluster, normally weight 1.
+      # new_cluster = add each extreme as a center and reassign similar days to it.
+      # Both methods can increase the final count above n_representative_days.
+      #
+      # NOT SUPPORTED
+      # replace creates a hybrid profile and is not retained by the ACES profile
+      # transfer step. Validation rejects replace; use append or new_cluster.
+      method: new_cluster
 
-      # max_value checks single HOURLY values.
-      # Active example: preserve the complete day containing peak hourly LAB demand.
-      # Preserve the day containing each profile's peak hourly demand.
+      # Day containing the largest single hourly value for each exact profile.
       max_value:
         - "DemandSpecificDistribution|NL|2025|D_ELEC"
         - "DemandSpecificDistribution|NS|2025|D_ELEC"
         - "DemandSpecificDistribution|PEI|2025|D_ELEC"
         - "DemandSpecificDistribution|NB|2025|D_ELEC"
 
-      # min_value checks single HOURLY values.
-      # Use for minimum temperature; avoid it for low wind because many days can hit zero.
-      # min_value: [temperature]
-      min_value: []  # ACTIVE: no minimum-hour extreme.
+      # Day containing the smallest single hourly value for each exact profile.
+      min_value: []
 
-      # max_period sums all 24 hours, then preserves the day with the largest total.
-      # Active example: preserve the highest-total-demand day.
-      #max_period: ["DemandSpecificDistribution|NS|2025|D_ELEC"]
+      # Day with the largest complete 24-hour total for each exact profile.
+      max_period: []
 
-      # min_period sums all 24 hours, then preserves the day with the smallest total.
-      # This is the recommended low-wind setting because it finds sustained low wind.
-      min_period: ["CapacityFactorTech|NS|E_WIND-ON_EX"]
-
-      # Alternative combined example:
-      # max_value: ["DemandSpecificDistribution|NS|2025|D_ELEC"]
-      # min_value: [temperature]
-      # max_period: ["CapacityFactorTech|NS|E_SOLPV-CEN"]
-      # min_period: ["CapacityFactorTech|NS|E_WIND-ON_EX"]
-      #
-      # Never repeat a YAML key. If min_period appears twice, YAML keeps only the
-      # final value and can silently disable the first setting.
+      # Day with the smallest complete 24-hour total for each exact profile.
+      # Recommended for sustained low-wind selection.
+      min_period:
+        - "CapacityFactorTech|NS|E_WIND-ON_EX"
 
     segmentation:
-      enabled: false  # Keep false to retain all ACES hours H00-H23.
-      n_segments: 24  # Number of within-day segments; fewer than 24 changes temporal resolution.
+      # Keep false to retain H00-H23. If enabled, n_segments must remain 24 in
+      # the current ACES writer, so segmentation provides no temporal reduction.
+      enabled: false
+      n_segments: 24
       representation:
-        type: mean  # How each segment is represented: mean | medoid | distribution | minmax_mean.
-        scope: cluster  # Used by distribution representation: cluster | global.
-        preserve_minmax: false  # Preserve segment-level minima/maxima when distribution is selected.
-        max_columns: []  # Used only by minmax_mean.
-        min_columns: []  # Used only by minmax_mean.
+        type: mean
 
     aggregate:
-      preserve_column_means: false  # false keeps exact historical medoid values; true would rescale them into synthetic values.
-      rescale_exclude_columns: []  # Profiles that must not be rescaled. Example: binary outage indicators.
-      round_decimals: 8  # Decimal places written to output. Example: 6 reduces file size.
-      numerical_tolerance: 1.0e-10  # Floating-point tolerance for bound/precision checks.
+      # Must remain false so medoid values stay equal to the selected source day.
+      preserve_column_means: false
+      rescale_exclude_columns: []
+      round_decimals: 8
+      numerical_tolerance: 1.0e-10
 
+  # ============================================================================
+  # DURATION-CURVE OPTIMIZATION ENGINE (PYOMO)
+  # Used only when clustering.engine: pyomo
+  # ============================================================================
   pyomo:
-    # This entire block is used when clustering.engine is pyomo or a Pyomo alias.
-    # Both solution methods minimize the same objective:
-    #
-    #   sum over profiles and bins of:
-    #     profile_weight * absolute(
-    #       full_year_exceedance_share
-    #       - weighted_representative_day_exceedance_share
-    #     )
-    #
-    # An exceedance share is the fraction of hourly values greater than or equal
-    # to a duration-curve bin threshold. This objective approximates annual value
-    # distributions; it does not minimize chronological H00-to-H00 reconstruction.
-    #
-    # solution_method: opt
-    #   One Pyomo optimization model chooses the representative days and their
-    #   occurrence weights together. With formulation: milp, binary variables
-    #   decide which historical days are selected. This searches systematically
-    #   for the minimum binned duration-curve exceedance error but can be expensive.
-    #
-    # solution_method: hybrid_random_weighting
-    #   Python randomly chooses exactly n_representative_days, treating that random
-    #   choice like a fixed binary assignment. Pyomo then changes only occurrence
-    #   weights to minimize the same binned duration-curve exceedance error. This
-    #   repeats n_random_iterations times, and the lowest-error result is retained.
-    #   After selection, every original day is assigned to its nearest selected day
-    #   for the audit CSV. Those nearest-day counts do not replace the optimized
-    #   Pyomo weights; SegFrac uses the optimized weights.
+    # OBJECTIVE
+    # For every selected profile and duration-curve bin, compare:
+    #   full-year exceedance share
+    #   versus weighted representative-day exceedance share
+    # Minimize the profile-weighted sum of absolute differences.
+
+    # SOLUTION METHODS
+    # opt:
+    #   formulation milp          -> jointly select N days and optimize weights.
+    #   formulation lp_fixed_days -> use fixed_day_ids and optimize weights only.
+    # hybrid_random_weighting:
+    #   randomly select N days, optimize their weights, repeat, and keep the best.
     solution_method: hybrid_random_weighting
 
-    # Used by solution_method: opt.
-    # milp = Pyomo chooses days automatically using binary selection variables.
-    # lp_fixed_days = you supply exactly N fixed_day_ids; Pyomo optimizes weights only.
-    # hybrid_random_weighting must use milp here because it creates its own random
-    # fixed-day sets before each weight-optimization solve.
+    # VALID COMBINATIONS
+    # opt + milp
+    # opt + lp_fixed_days + use_integer_weights false
+    # hybrid_random_weighting + milp
     formulation: milp
 
-    # false = continuous representative-day weights, so every hybrid iteration is
-    # a linear program. Example weights may be 24.6 and 31.4.
-    # true = whole-number weights. The weight problem then contains integer
-    # variables and is no longer a pure linear program.
+    # false allows fractional occurrence weights.
+    # true requires whole-day weights and makes weight optimization integer-based.
+    # lp_fixed_days requires false.
     use_integer_weights: false
 
-    # Required only for formulation: lp_fixed_days.
-    # Day IDs are chronological and one-based: 1 = first ACES calendar day.
-    # Every forced extreme must also be listed here when using lp_fixed_days.
+    # Required only by opt + lp_fixed_days.
+    # IDs are one-based chronological positions: 1 is the first calendar day.
+    # The list must contain exactly n_representative_days unique IDs.
     fixed_day_ids: []
 
-    # Number of duration-curve thresholds used in the objective for every profile.
-    # More bins describe annual distributions in more detail but create a larger
-    # model. The objective compares annual exceedance shares at these thresholds;
-    # it does not compare original and representative years hour by hour.
+    # Number of exceedance thresholds per selected profile.
+    # More bins improve duration-curve detail but increase model size and runtime.
     n_bins: 30
 
-    # Normalize every selected profile before calculating error.
-    # minmax prevents a large-unit profile from dominating a small-unit profile.
-    # Supported values: minmax | zscore | robust | none.
+    # Profile normalization before objective construction:
+    # minmax | zscore | robust | none
     normalization: minmax
 
-    # Number of independent random selections tested by the hybrid method.
-    # Start with 100-500 for testing. Values such as 50000 can take a very long time
-    # because one Pyomo weight optimization is solved during every iteration.
+    # Used only by hybrid_random_weighting.
     n_random_iterations: 10
-    random_seed: 40  # Same seed reproduces the same random selections.
+    random_seed: 40
 
-    # Optional random search-pool limit. null allows every candidate day.
-    # Example: 100 chooses a reproducible pool of 100 days, then all random
-    # iterations draw from that smaller pool. Forced extremes are always retained.
+    # Used only by hybrid_random_weighting.
+    # null draws from every candidate day. An integer first creates a reproducible
+    # random pool of that size; forced extremes remain available.
     sampled_candidate_pool_size: null
 
-    # CANDIDATE PRESCREENING
-    # This is only a preliminary reduction. It does not determine the final
-    # representative-day count. The processing order is:
-    #
-    #   366 original historical days
-    #     -> candidate_reduction_method keeps n_candidate_days actual days
-    #     -> configured forced extremes are added if they were not retained
-    #     -> Pyomo selects n_representative_days final days
-    #
-    # Example with n_candidate_days: 80 and n_representative_days: 15:
-    #
-    #   366 days -> 80 preliminary candidate days -> 15 final representative days
-    #
-    # candidate_reduction_method options:
-    #
-    # none
-    #   No prescreening. All 365/366 days are available to Pyomo.
-    #   n_candidate_days is ignored. This provides the broadest search but creates
-    #   the largest model and can require considerably more memory and time.
-    #
-    # kmeans_nearest_day
-    #   K-means creates n_candidate_days preliminary groups. For every group, the
-    #   real historical day nearest its mathematical center is retained. Therefore,
-    #   n_candidate_days: 80 means approximately 80 k-means groups and 80 real
-    #   candidate dates. random_seed makes this prescreening reproducible.
-    #
-    # ward_nearest_day
-    #   Ward hierarchical clustering creates n_candidate_days preliminary groups
-    #   and retains the real historical day nearest each group center. It is
-    #   deterministic and stable, but can be slower than k-means.
-    #
-    # extreme_plus_kmeans / extreme_plus_ward
-    #   Legacy prescreening modes that attempt to retain generic demand/wind
-    #   extremes before k-means or Ward reduction. For ACES, use
-    #   kmeans_nearest_day or ward_nearest_day together with the exact named
-    #   extremes below; named rules provide region/year/technology control.
-    candidate_reduction_method: extreme_plus_ward
+    # CANDIDATE REDUCTION
+    # none                 -> use all original days; mode/count below are ignored.
+    # kmeans_nearest_day   -> keep the real day nearest each k-means center.
+    # ward_nearest_day     -> keep the real day nearest each Ward cluster center.
+    # extreme_plus_* are legacy aliases; use exact extremes below instead.
+    candidate_reduction_method: ward_nearest_day
 
-    # candidate_feature_mode controls how candidate prescreening compares days:
-    #
-    # chronological_daily_profile
-    #   Compares H00 with H00, H01 with H01, ..., H23 with H23 for every selected
-    #   ACES profile. Preserves hourly timing, ramps, morning/evening peaks and
-    #   correlations between demand, wind and solar. Recommended general default.
-    #
-    # daily_duration_curve
-    #   Sorts each day's 24 values from highest to lowest before comparison.
-    #   Preserves the within-day value distribution but discards the hour at which
-    #   each value occurred. Useful when duration-curve quality matters most.
-    #
-    # hybrid_profile_and_duration
-    #   Uses both the chronological H00-H23 profile and its sorted duration curve.
-    #   Preserves more information but approximately doubles candidate feature size.
-    #
-    # summary_statistics
-    #   Compares daily mean, minimum, maximum, standard deviation, range and ramp
-    #   statistics. Fastest and smallest option, but it loses detailed hourly shape.
+    # Used only when candidate_reduction_method is not none:
+    # chronological_daily_profile = preserve H00-H23 timing.
+    # daily_duration_curve         = compare sorted daily values.
+    # hybrid_profile_and_duration  = use both forms.
+    # summary_statistics           = use daily statistics and ramps.
     candidate_feature_mode: chronological_daily_profile
 
-    # Number of actual historical days retained after candidate prescreening.
-    # null uses all days and disables reduction.
-    # It must be at least n_representative_days and cannot exceed the original
-    # number of days. A smaller value runs faster but can exclude a useful day.
+    # Required when candidate reduction is enabled. Must be between
+    # n_representative_days and the number of original days.
     n_candidate_days: 250
 
-    # Recommended faster starting example:
-    # candidate_reduction_method: kmeans_nearest_day
-    # candidate_feature_mode: chronological_daily_profile
-    # n_candidate_days: 80
-    #
-    # More detailed but slower example:
-    # candidate_reduction_method: ward_nearest_day
-    # candidate_feature_mode: hybrid_profile_and_duration
-    # n_candidate_days: 120
-
     # Manual one-based historical day IDs that must be selected.
-    # These days count toward n_representative_days.
+    # Forced days count inside n_representative_days.
     forced_day_ids: []
 
     extremes:
       enabled: true
 
-      # Pyomo supports force_within_count. Unlike TSAM append, forced days do not
-      # increase the final count. If several rules find the same date, it is counted
-      # only once. The run stops with a clear error when unique forced days exceed N.
+      # Pyomo extremes always count inside n_representative_days.
       selection_mode: force_within_count
 
-      # Force each complete day containing the listed profile's highest hourly value.
       max_value:
         - "DemandSpecificDistribution|NL|2025|D_ELEC"
         - "DemandSpecificDistribution|NS|2025|D_ELEC"
         - "DemandSpecificDistribution|PEI|2025|D_ELEC"
         - "DemandSpecificDistribution|NB|2025|D_ELEC"
 
-      # Force each day containing the listed profile's lowest hourly value.
       min_value: []
-
-      # Force each day with the largest 24-hour total for the listed profile.
       max_period: []
-
-      # Recommended for sustained low wind: force the day having the lowest
-      # complete 24-hour capacity-factor total.
       min_period:
         - "CapacityFactorTech|NS|E_WIND-ON_EX"
 
-      # Optional system-wide rules. These create at most one extra day per rule.
-      # The named profile lists above give more control across regions and years.
+      # Optional system-wide rules. Exact profile rules above provide more control.
       include_peak_demand_day: false
       include_min_wind_day: false
       include_max_daily_ramp_day: true
 
-    # Prevent any selected day from receiving zero weight. Keep this true for ACES
-    # so all written representative dates have a meaningful occurrence weight.
+    # Prevent selected days from receiving zero occurrence weight.
     enforce_positive_weight: true
     minimum_weight: 1.0
 
     solver:
-      # HiGHS is open source. CPLEX and Gurobi can also be used when installed.
+      # highs is open source. cplex and gurobi require separate installations.
       name: cplex
       time_limit_seconds: 300
-      # Relevant to models containing binary/integer variables; ignored by a
-      # continuous hybrid weight LP when the solver does not need a MIP gap.
       mip_gap: 0.001
       threads: 6
       tee: true
 
+# OUTPUT DATABASE VALIDATION
+# Complete days, H00-H23 structure, and SQLite integrity are always checked.
 validation:
-  require_complete_days: true  # Reject dates missing one or more expected hours.
-  require_24_hours_per_day: true  # Require exactly H00-H23 for each source day.
-  require_dsd_sum_one: true  # Verify each reduced DSD profile sums to 1.
-  dsd_sum_tolerance: 1.0e-8  # Allowed difference from 1 for DSD validation.
-  require_segfrac_sum_one: true  # Verify all output SegFrac values sum to 1.
-  segfrac_sum_tolerance: 1.0e-8  # Allowed difference from 1 for SegFrac validation.
-  require_cf_between_zero_and_one: true  # Reject capacity factors outside [0,1].
-  compare_annual_means: true  # Report original versus reduced weighted annual means.
-  compare_duration_curves: true  # Report duration-curve approximation quality.
-  fail_on_missing_temporal_table: false  # false skips empty optional tables; true stops the run.
+  require_dsd_sum_one: true
+  dsd_sum_tolerance: 1.0e-8
+  require_segfrac_sum_one: true
+  segfrac_sum_tolerance: 1.0e-8
 
+  # false skips missing or empty optional temporal tables.
+  # true requires every enabled temporal table to exist and contain data.
+  fail_on_missing_temporal_table: false
+
+# AUDIT OUTPUTS
+# The reduced database and core CSV audits are always written.
 outputs:
-  write_database: true  # Create the reduced ACES SQLite database.
-  # Creates representative_day_audit.xlsx for both TSAM and Pyomo with:
-  # Run_Summary, Representative_Days, Forced_Extremes, Day_Assignments,
-  # Profile_Weights, Accuracy, and the complete Configuration.
-  # Forced_Extremes identifies the exact rule/profile, ACES table, region,
-  # period, demand or technology, selected date/hour, and measured value.
   write_excel_audit: true
-  write_csv_audit: true  # Create CSV audit tables.
-  write_cluster_assignments: true  # Save original-day to representative-day mapping.
-  write_representative_profiles: true  # Save all representative hourly profiles.
-  write_accuracy_metrics: true  # Save RMSE/MAE and related quality metrics.
-  write_run_configuration: true  # Copy the exact YAML used into the output folder.
+  write_accuracy_metrics: true

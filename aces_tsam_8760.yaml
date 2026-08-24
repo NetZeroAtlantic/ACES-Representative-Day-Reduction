@@ -337,7 +337,25 @@ clustering:
       # Optional system-wide rules. Exact profile rules above provide more control.
       include_peak_demand_day: false
       include_min_wind_day: false
-      include_max_daily_ramp_day: true
+
+      # Force one maximum demand-ramp day for every configured region.
+      # If several regions select the same historical date, that date counts only
+      # once inside n_representative_days, while every regional reason is audited.
+      include_max_daily_ramp_day:
+        enabled: true
+
+        # first_model_period uses the earliest period among the selected DSD
+        # profiles. An explicit period such as 2025 is also accepted.
+        reference_period: first_model_period
+
+        # all uses every region in the selected DSD profiles.
+        # A subset can be supplied, for example: [NL, NS, NB, PEI]
+        regions: all
+
+        # absolute = largest change in either direction.
+        # upward   = largest increase from one hour to the next.
+        # downward = largest decrease from one hour to the next.
+        direction: absolute
 
     # Prevent selected days from receiving zero occurrence weight.
     enforce_positive_weight: true

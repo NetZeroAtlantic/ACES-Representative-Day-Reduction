@@ -1176,21 +1176,74 @@ def build_extreme_audit_records(
                 )
             )
 
-    if is_pyomo and extreme_config.get(
-        "include_max_daily_ramp_day", False
-    ):
+    ramp_config = extreme_config.get("include_max_daily_ramp_day", False)
+    if is_pyomo and ramp_rule_enabled(ramp_config):
+        ramp_options = ramp_config if isinstance(ramp_config, dict) else {}
+        direction = str(ramp_options.get("direction", "absolute")).lower()
+        if direction not in {"absolute", "upward", "downward"}:
+            raise ValueError(
+                "include_max_daily_ramp_day.direction must be absolute, "
+                "upward, or downward."
+            )
         demand_columns = [
             column
             for column in selected_columns
             if metadata.get(column) is not None
             and metadata[column].table == "DemandSpecificDistribution"
         ]
-        if demand_columns:
+        available_regions = sorted(
+            {
+                profile_key(metadata[column], "regions")
+                for column in demand_columns
+                if profile_key(metadata[column], "regions") not in {None, ""}
+            }
+        )
+        configured_regions = ramp_options.get("regions", "all")
+        if configured_regions == "all":
+            regions = available_regions
+        elif isinstance(configured_regions, list):
+            regions = [str(region) for region in configured_regions]
+        else:
+            raise ValueError(
+                "include_max_daily_ramp_day.regions must be all or a list."
+            )
+        missing_regions = sorted(set(regions) - set(available_regions))
+        if missing_regions:
+            raise ValueError(
+                "Demand-ramp regions were not found in selected DSD profiles: "
+                f"{missing_regions}"
+            )
+        available_periods = sorted(
+            {
+                profile_key(metadata[column], "periods")
+                for column in demand_columns
+                if profile_key(metadata[column], "periods") not in {None, ""}
+            },
+            key=lambda value: int(value),
+        )
+        reference_period = resolve_reference_period(
+            ramp_options.get("reference_period", "first_model_period"),
+            available_periods,
+            "demand ramp",
+        )
+        for region in regions:
+            regional_columns = [
+                column
+                for column in demand_columns
+                if str(profile_key(metadata[column], "regions")) == region
+                and str(profile_key(metadata[column], "periods"))
+                == str(reference_period)
+            ]
+            if not regional_columns:
+                raise ValueError(
+                    f"No selected DSD profiles found for demand ramp region "
+                    f"{region} and period {reference_period}."
+                )
             demand = normalize_for_extreme_detection(
-                profiles[demand_columns]
+                profiles[regional_columns]
             ).sum(axis=1)
             daily = demand.to_numpy().reshape(n_days, hours_per_day)
-            daily_ramps = np.abs(np.diff(daily, axis=1))
+            daily_ramps = calculate_ramps(daily, direction)
             day_position = int(np.argmax(daily_ramps.max(axis=1)))
             ramp_position = int(np.argmax(daily_ramps[day_position]))
             records.append(
@@ -1198,7 +1251,7 @@ def build_extreme_audit_records(
                     engine=engine,
                     selection_method=selection_method,
                     rule="include_max_daily_ramp_day",
-                    profile="<all selected DSD profiles>",
+                    profile="<selected regional DSD profiles>",
                     metadata=None,
                     day_position=day_position,
                     seasons=seasons,
@@ -1208,7 +1261,10 @@ def build_extreme_audit_records(
                     ),
                     profile_in_clustering=True,
                     table="DemandSpecificDistribution",
-                    profile_count=len(demand_columns),
+                    profile_count=len(regional_columns),
+                    regions=region,
+                    periods=reference_period,
+                    demand_name="<all selected>",
                 )
             )
 
@@ -1267,6 +1323,10 @@ def extreme_record(
     profile_in_clustering: bool,
     table: str | None = None,
     profile_count: int = 1,
+    regions: Any | None = None,
+    periods: Any | None = None,
+    demand_name: Any | None = None,
+    tech: Any | None = None,
 ) -> dict[str, Any]:
     keyed = (
         {
@@ -1284,10 +1344,14 @@ def extreme_record(
         "rule": rule,
         "profile": profile,
         "table": table or (metadata.table if metadata is not None else ""),
-        "regions": keyed.get("regions", ""),
-        "periods": keyed.get("periods", ""),
-        "demand_name": keyed.get("demand_name", ""),
-        "tech": keyed.get("tech", ""),
+        "regions": keyed.get("regions", "") if regions is None else regions,
+        "periods": keyed.get("periods", "") if periods is None else periods,
+        "demand_name": (
+            keyed.get("demand_name", "")
+            if demand_name is None
+            else demand_name
+        ),
+        "tech": keyed.get("tech", "") if tech is None else tech,
         "profile_keys": " | ".join(
             f"{name}={value}" for name, value in keyed.items()
         ),
@@ -1305,6 +1369,48 @@ def normalize_for_extreme_detection(frame: pd.DataFrame) -> pd.DataFrame:
     ranges = frame.max(axis=0) - minimum
     ranges = ranges.mask(ranges.abs() <= 1e-13, 1.0)
     return (frame - minimum) / ranges
+
+
+def profile_key(metadata: ProfileMetadata, name: str) -> Any | None:
+    keyed = dict(zip(metadata.key_columns, metadata.key_values))
+    return keyed.get(name)
+
+
+def ramp_rule_enabled(config: Any) -> bool:
+    if isinstance(config, dict):
+        return bool(config.get("enabled", False))
+    return bool(config)
+
+
+def resolve_reference_period(
+    configured_period: Any,
+    available_periods: list[Any],
+    rule_name: str,
+) -> Any:
+    if not available_periods:
+        raise ValueError(f"No periods are available for {rule_name} selection.")
+    if configured_period == "first_model_period":
+        return min(available_periods, key=lambda value: int(value))
+    matches = [
+        period
+        for period in available_periods
+        if str(period) == str(configured_period)
+    ]
+    if not matches:
+        raise ValueError(
+            f"Configured {rule_name} reference period {configured_period} was "
+            f"not found. Available periods: {available_periods}"
+        )
+    return matches[0]
+
+
+def calculate_ramps(daily_values: np.ndarray, direction: str) -> np.ndarray:
+    changes = np.diff(daily_values, axis=1)
+    if direction == "absolute":
+        return np.abs(changes)
+    if direction == "upward":
+        return changes
+    return -changes
 
 
 def build_pyomo_representatives(

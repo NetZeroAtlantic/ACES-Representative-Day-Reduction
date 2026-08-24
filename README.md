@@ -223,6 +223,8 @@ Pyomo extreme days count inside `n_representative_days`. If N is 15 and five uni
 
 Supported controls are exact profile rules (`max_value`, `min_value`, `max_period`, and `min_period`), system rules (`include_peak_demand_day`, `include_min_wind_day`, and `include_max_daily_ramp_day`), and manual one-based IDs under `forced_day_ids`.
 
+`include_max_daily_ramp_day` can force one demand-ramp day for each selected region. Set `reference_period` to `first_model_period` or an explicit ACES period, set `regions` to `all` or a list, and choose `direction: absolute`, `upward`, or `downward`. The calculation combines the selected DSD profiles within each region after normalizing their shapes. It compares H00-H01 through H22-H23 and does not compare H23 with the following day's H00.
+
 If multiple rules select the same date, it counts once but every reason is retained in the audit output.
 
 ## Profile Selection and Weights

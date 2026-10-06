@@ -43,6 +43,7 @@ class PyomoAcesResult:
     accuracy: AccuracySummary
     forced_day_ids: list[int]
     objective_value: float
+    iteration_history: pd.DataFrame | None = None
 
 
 def main() -> None:
@@ -174,6 +175,7 @@ def main() -> None:
             {int(record["day_id"]) for record in extreme_records}
         )
         objective_value = None
+        iteration_history = None
     elif engine in {"pyomo", "pyomo_milp", "pyomo_lp_fixed_days"}:
         pyomo_result = run_pyomo(
             database=database,
@@ -195,6 +197,7 @@ def main() -> None:
         accuracy = pyomo_result.accuracy
         forced_day_ids = pyomo_result.forced_day_ids
         objective_value = pyomo_result.objective_value
+        iteration_history = pyomo_result.iteration_history
     else:
         raise ValueError(
             "clustering.engine must be tsam, pyomo, pyomo_milp, or "
@@ -227,6 +230,7 @@ def main() -> None:
         selected_columns,
         column_weights,
         metadata,
+        iteration_history,
     )
     print(f"Created reduced ACES database: {output_database}")
 
@@ -1164,6 +1168,7 @@ def run_pyomo(
         accuracy=accuracy,
         forced_day_ids=forced_day_ids,
         objective_value=float(optimization_result.objective_value),
+        iteration_history=optimization_result.iteration_history,
     )
 
 
@@ -2309,6 +2314,7 @@ def write_audits(
     selected_columns: list[str],
     column_weights: dict[str, float],
     metadata: dict[str, ProfileMetadata],
+    iteration_history: pd.DataFrame | None = None,
 ) -> None:
     output_directory.mkdir(parents=True, exist_ok=True)
     assignments = pd.DataFrame(
@@ -2501,6 +2507,10 @@ def write_audits(
                 }
             ]
         ).to_csv(output_directory / "pyomo_summary.csv", index=False)
+        if iteration_history is not None and not iteration_history.empty:
+            iteration_history.to_csv(
+                output_directory / "pyomo_iteration_history.csv", index=False
+            )
     if config.get("outputs", {}).get("write_excel_audit", True):
         excel_path = output_directory / "representative_day_audit.xlsx"
         with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
@@ -2522,6 +2532,10 @@ def write_audits(
             accuracy_table.to_excel(
                 writer, sheet_name="Accuracy", index=False
             )
+            if iteration_history is not None and not iteration_history.empty:
+                iteration_history.to_excel(
+                    writer, sheet_name="Pyomo_Iterations", index=False
+                )
             configuration.to_excel(
                 writer, sheet_name="Configuration", index=False
             )

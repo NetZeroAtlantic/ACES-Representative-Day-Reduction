@@ -21,6 +21,7 @@ class OptimizationResult:
     approx_exceedance_shares: Dict[str, np.ndarray]
     L_table: pd.DataFrame
     A_table: pd.DataFrame
+    iteration_history: pd.DataFrame | None = None
 
 
 class RepresentativeDayOptimizer:

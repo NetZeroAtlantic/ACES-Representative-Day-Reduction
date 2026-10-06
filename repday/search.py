@@ -1,14 +1,45 @@
 from __future__ import annotations
 
 import random
+from math import comb
 from typing import List, Optional
 
+import numpy as np
+import pandas as pd
 import pyomo.environ as pyo
 from pyomo.opt import SolverStatus, TerminationCondition
+
+from .metrics import duration_curve_metrics
 
 
 def run_full_opt(optimizer):
     return optimizer.solve()
+
+
+def _draw_unique_combinations(
+    rng: random.Random,
+    candidates: List[int],
+    selection_count: int,
+    number_of_combinations: int,
+) -> list[tuple[int, ...]]:
+    """Draw unique unordered candidate sets without materializing all sets."""
+    maximum_combinations = comb(len(candidates), selection_count)
+    if number_of_combinations > maximum_combinations:
+        raise ValueError(
+            f"Requested {number_of_combinations} random iterations, but only "
+            f"{maximum_combinations} unique day combinations are possible when "
+            f"choosing {selection_count} from {len(candidates)} candidates."
+        )
+
+    combinations: list[tuple[int, ...]] = []
+    seen: set[tuple[int, ...]] = set()
+    while len(combinations) < number_of_combinations:
+        combination = tuple(sorted(rng.sample(candidates, selection_count)))
+        if combination in seen:
+            continue
+        seen.add(combination)
+        combinations.append(combination)
+    return combinations
 
 
 def run_hybrid_random_weighting(
@@ -91,19 +122,44 @@ def run_hybrid_random_weighting(
     L, A, bin_lower_bounds = temp_optimizer._build_L_A(day_ids_all)
     n_total = len(prepared.day_labels)
     attr_weights = {a.name: float(a.weight) for a in active_attributes}
+    day_to_position = {
+        day_id: position for position, day_id in enumerate(prepared.day_labels)
+    }
+    clustering_features = np.concatenate(
+        [
+            prepared.daily_profiles[attr.name]
+            * np.sqrt(max(float(attr.weight), 0.0))
+            for attr in active_attributes
+            if float(attr.weight) > 0
+        ],
+        axis=1,
+    )
+    raw_daily_profiles = {
+        attr.name: prepared.hourly.pivot(
+            index="day_id",
+            columns="hour_in_day",
+            values=attr.column,
+        ).sort_index().to_numpy(dtype=float)
+        for attr in active_attributes
+    }
 
     best_result = None
     best_obj = float("inf")
+    best_iteration = None
+    iteration_rows = []
 
+    n_to_sample = n_representative_days - len(forced_day_ids)
+    if n_to_sample < 0:
+        raise ValueError("n_representative_days smaller than forced_day_ids count")
+    random_combinations = _draw_unique_combinations(
+        rng=rng,
+        candidates=remaining,
+        selection_count=n_to_sample,
+        number_of_combinations=n_random_iterations,
+    )
 
-
-    for _ in range(n_random_iterations):
-        n_to_sample = n_representative_days - len(forced_day_ids)
-        if n_to_sample < 0:
-            raise ValueError("n_representative_days smaller than forced_day_ids count")
-
-        sampled = forced_day_ids + rng.sample(remaining, n_to_sample)
-        sampled = sorted(set(sampled))
+    for iteration, random_combination in enumerate(random_combinations, start=1):
+        sampled = sorted(forced_day_ids + list(random_combination))
 
         # Build LP with sampled days fixed
         m = pyo.ConcreteModel(name="HybridRandomWeighting")
@@ -177,16 +233,153 @@ def run_hybrid_random_weighting(
             }
         )
         if not acceptable:
+            iteration_rows.append(
+                {
+                    "iteration": iteration,
+                    "metric_scope": "solver",
+                    "attribute": "",
+                    "solver_status": str(status),
+                    "termination_condition": str(term),
+                    "acceptable_solution": False,
+                    "is_best_iteration": False,
+                    "objective_value": None,
+                    "selected_day_ids": ", ".join(map(str, sampled)),
+                    "random_day_ids": ", ".join(map(str, random_combination)),
+                    "forced_day_ids": ", ".join(map(str, forced_day_ids)),
+                    "optimized_day_weights": "",
+                }
+            )
             continue
 
         obj = float(pyo.value(m.obj))
+        iteration_day_weights = {
+            d: float(pyo.value(m.w[d]))
+            for d in sampled
+            if pyo.value(m.w[d]) is not None and pyo.value(m.w[d]) > 1e-8
+        }
+        representative_positions = [day_to_position[d] for d in sampled]
+        representative_features = clustering_features[representative_positions]
+        nearest_assignments = np.argmin(
+            np.sum(
+                (
+                    clustering_features[:, np.newaxis, :]
+                    - representative_features[np.newaxis, :, :]
+                )
+                ** 2,
+                axis=2,
+            ),
+            axis=1,
+        )
+        for cluster, position in enumerate(representative_positions):
+            nearest_assignments[position] = cluster
+
+        metric_values = []
+        for attr in active_attributes:
+            original_curve = prepared.original_duration_curves[attr.name]
+            approximated_curve = temp_optimizer._weighted_duration_curve_from_selected_days(
+                daily_profiles=prepared.daily_profiles[attr.name],
+                day_ids=day_ids_all,
+                day_weights=iteration_day_weights,
+                target_length=len(original_curve),
+            )
+            duration_metrics = duration_curve_metrics(
+                original_curve, approximated_curve
+            )
+            raw_profiles = raw_daily_profiles[attr.name]
+            reconstructed_profiles = raw_profiles[representative_positions][
+                nearest_assignments
+            ]
+            reconstruction_errors = raw_profiles - reconstructed_profiles
+            metrics = {
+                "chronological_rmse": float(
+                    np.sqrt(np.mean(reconstruction_errors**2))
+                ),
+                "chronological_mae": float(
+                    np.mean(np.abs(reconstruction_errors))
+                ),
+                "duration_curve_rmse": duration_metrics["rmse"],
+                "duration_curve_mae": duration_metrics["mae"],
+                "duration_curve_nrmse": duration_metrics["nrmse"],
+                "peak_error": duration_metrics["peak_error"],
+                "annual_energy_error": duration_metrics[
+                    "annual_energy_error"
+                ],
+            }
+            bin_absolute_error_sum = float(
+                sum(pyo.value(m.err[attr.name, b]) for b in m.B)
+            )
+            objective_contribution = (
+                float(attr.weight) * bin_absolute_error_sum
+            )
+            metric_values.append((attr, metrics))
+            iteration_rows.append(
+                {
+                    "iteration": iteration,
+                    "metric_scope": "attribute",
+                    "attribute": attr.name,
+                    "attribute_weight": float(attr.weight),
+                    "solver_status": str(status),
+                    "termination_condition": str(term),
+                    "acceptable_solution": True,
+                    "is_best_iteration": False,
+                    "selection_metric": "objective_value",
+                    "objective_value": obj,
+                    "bin_absolute_error_sum": bin_absolute_error_sum,
+                    "objective_contribution": objective_contribution,
+                    "selected_day_ids": ", ".join(map(str, sampled)),
+                    "random_day_ids": ", ".join(map(str, random_combination)),
+                    "forced_day_ids": ", ".join(map(str, forced_day_ids)),
+                    "optimized_day_weights": "; ".join(
+                        f"{day_id}={weight:.12g}"
+                        for day_id, weight in sorted(iteration_day_weights.items())
+                    ),
+                    **metrics,
+                }
+            )
+
+        total_attribute_weight = sum(float(attr.weight) for attr, _ in metric_values)
+        if metric_values and total_attribute_weight > 0:
+            aggregate_metrics = {
+                metric_name: sum(
+                    float(attr.weight) * metrics[metric_name]
+                    for attr, metrics in metric_values
+                )
+                / total_attribute_weight
+                for metric_name in next(iter(metric_values))[1]
+            }
+            iteration_rows.append(
+                {
+                    "iteration": iteration,
+                    "metric_scope": "weighted_mean",
+                    "attribute": "<all active attributes>",
+                    "attribute_weight": total_attribute_weight,
+                    "solver_status": str(status),
+                    "termination_condition": str(term),
+                    "acceptable_solution": True,
+                    "is_best_iteration": False,
+                    "selection_metric": "objective_value",
+                    "objective_value": obj,
+                    "bin_absolute_error_sum": sum(
+                        float(
+                            sum(pyo.value(m.err[attr.name, b]) for b in m.B)
+                        )
+                        for attr in active_attributes
+                    ),
+                    "objective_contribution": obj,
+                    "selected_day_ids": ", ".join(map(str, sampled)),
+                    "random_day_ids": ", ".join(map(str, random_combination)),
+                    "forced_day_ids": ", ".join(map(str, forced_day_ids)),
+                    "optimized_day_weights": "; ".join(
+                        f"{day_id}={weight:.12g}"
+                        for day_id, weight in sorted(iteration_day_weights.items())
+                    ),
+                    **aggregate_metrics,
+                }
+            )
+
         if obj < best_obj:
             # Build a result object similar to optimizer.solve()
-            day_weights = {
-                d: float(pyo.value(m.w[d]))
-                for d in sampled
-                if pyo.value(m.w[d]) is not None and pyo.value(m.w[d]) > 1e-8
-            }
+            day_weights = iteration_day_weights
 
             rows = []
             for d in day_ids_all:
@@ -197,9 +390,6 @@ def run_hybrid_random_weighting(
                         "weight": float(day_weights.get(d, 0.0)),
                     }
                 )
-
-            import pandas as pd
-            import numpy as np
 
             summary = pd.DataFrame(rows).sort_values(
                 ["selected", "weight", "day_id"],
@@ -273,8 +463,20 @@ def run_hybrid_random_weighting(
                 A_table=A_table,
             )
             best_obj = obj
+            best_iteration = iteration
 
     if best_result is None:
         raise RuntimeError("hybrid_random_weighting did not produce any valid solution.")
+
+    iteration_history = pd.DataFrame(iteration_rows)
+    if not iteration_history.empty:
+        iteration_history["is_best_iteration"] = (
+            iteration_history["iteration"] == best_iteration
+        )
+        iteration_history = iteration_history.sort_values(
+            ["iteration", "metric_scope", "attribute"],
+            kind="stable",
+        ).reset_index(drop=True)
+    best_result.iteration_history = iteration_history
 
     return best_result

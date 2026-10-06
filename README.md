@@ -45,6 +45,30 @@ project:
 
 The database must contain the ACES calendar tables and the enabled temporal tables listed under `aces.temporal_tables`. The current calendar configuration expects 366 days and hourly labels `H00` through `H23`.
 
+### Date formats
+
+`aces.calendar.season_format` defines the canonical format used by `time_season`, the internal hourly index, and the reduced output database. Each temporal table separately declares `source_season_format`, which describes how that source table stores its raw season labels. The runner parses every label with the declared source format and converts it to the canonical calendar before combining demand, capacity factors, costs, or other profiles.
+
+For the supplied database, the correct mapping is:
+
+```yaml
+aces:
+  calendar:
+    season_format: "%m-%d"  # time_season uses month-day
+
+  temporal_tables:
+    - table: DemandSpecificDistribution
+      source_season_format: "%d-%m"  # DSD uses day-month
+
+    - table: CapacityFactorTech
+      source_season_format: "%m-%d"  # CF uses month-day
+
+    - table: CapacityFactorProcess
+      source_season_format: "%m-%d"  # CF uses month-day
+```
+
+Do not select a format by looking only at labels such as `01-04`, because that string is valid in both orders. An incorrect format now fails validation when possible instead of swapping only unambiguous dates.
+
 ## 2. Install Dependencies
 
 From the project directory:

@@ -44,6 +44,7 @@ project:
 # Change this section only when the input database uses different table or column names.
 aces:
   calendar:
+    # Canonical ACES calendar used internally and written to the output database.
     season_table: time_season
     season_column: t_season
     season_format: "%m-%d"
@@ -63,10 +64,14 @@ aces:
 
   temporal_tables:
     # Each key_columns combination becomes one independent hourly profile.
+    # source_season_format states how that table stores its raw season labels.
+    # Every label is parsed with this exact format and aligned to time_season
+    # before profiles from different tables are compared.
     # Empty optional tables are skipped when validation.fail_on_missing_temporal_table is false.
     - table: DemandSpecificDistribution
       enabled: true
       season_column: season_name
+      source_season_format: "%d-%m"
       hour_column: time_of_day_name
       value_column: dsd
       key_columns: [regions, periods, demand_name]
@@ -77,6 +82,7 @@ aces:
     - table: CapacityFactorTech
       enabled: true
       season_column: season_name
+      source_season_format: "%m-%d"
       hour_column: time_of_day_name
       value_column: cf_tech
       key_columns: [regions, tech]
@@ -86,6 +92,7 @@ aces:
     - table: CapacityFactorProcess
       enabled: true
       season_column: season_name
+      source_season_format: "%m-%d"
       hour_column: time_of_day_name
       value_column: cf_process
       key_columns: [regions, tech, vintage]
@@ -95,6 +102,7 @@ aces:
     - table: EfficiencyVariable
       enabled: true
       season_column: season_name
+      source_season_format: "%m-%d"
       hour_column: time_of_day_name
       value_column: efficiencyvar
       key_columns: [regions, input_comm, tech, output_comm]
@@ -102,8 +110,11 @@ aces:
       output_rule: representative_profile
 
     - table: CostVariableVariable
-      enabled: true
+      # This input database contains only seven days in this table. Keep it
+      # disabled until a complete 8760/8784-hour profile is supplied.
+      enabled: false
       season_column: season_name
+      source_season_format: "%m-%d"
       hour_column: time_of_day_name
       value_column: costvarvar
       key_columns: [regions, tech]
@@ -264,6 +275,7 @@ clustering:
             mode: uniform_full_year
             table: SegFrac
             season_column: season_name
+            source_season_format: "%m-%d"
             hour_column: time_of_day_name
             value_column: segfrac
 
@@ -297,7 +309,7 @@ clustering:
       preserve_column_means: false
       rescale_exclude_columns: []
       round_decimals: 8
-      numerical_tolerance: 1.0e-10
+      numerical_tolerance: 1.0e-8
 
   # ============================================================================
   # DURATION-CURVE OPTIMIZATION ENGINE (PYOMO)
@@ -456,6 +468,7 @@ clustering:
             mode: uniform_full_year
             table: SegFrac
             season_column: season_name
+            source_season_format: "%m-%d"
             hour_column: time_of_day_name
             value_column: segfrac
 

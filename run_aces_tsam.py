@@ -5,6 +5,7 @@ import inspect
 import shutil
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +96,7 @@ def main() -> None:
         seasons=seasons,
         hours=hours,
         engine=engine,
+        calendar=config["aces"]["calendar"],
     )
     if args.validate_only:
         print(
@@ -112,6 +114,7 @@ def main() -> None:
         seasons=seasons,
         hours=hours,
         engine=engine,
+        calendar=config["aces"]["calendar"],
     )
     if engine == "tsam":
         custom_ramp_rules = {
@@ -182,6 +185,7 @@ def main() -> None:
             seasons=seasons,
             hours=hours,
             engine=engine,
+            calendar=config["aces"]["calendar"],
             extreme_records=extreme_records,
         )
         representatives = pyomo_result.representatives
@@ -236,6 +240,7 @@ def validate_clustering_settings(
     seasons: list[str],
     hours: list[str],
     engine: str,
+    calendar: dict[str, Any],
 ) -> None:
     allowed_engines = {
         "tsam",
@@ -321,6 +326,7 @@ def validate_clustering_settings(
             seasons=seasons,
             hours=hours,
             engine=engine,
+            calendar=calendar,
         )
         return
 
@@ -410,6 +416,7 @@ def validate_clustering_settings(
         seasons=seasons,
         hours=hours,
         engine=engine,
+        calendar=calendar,
     )
     forced_day_ids = {
         int(record["day_id"]) for record in extreme_records
@@ -492,7 +499,13 @@ def load_aces_profiles(
                 print(f"Skipping missing table: {table}")
                 continue
             frame, table_metadata = load_temporal_table(
-                connection, table_config, seasons, hours, index
+                connection,
+                table_config,
+                seasons,
+                hours,
+                index,
+                calendar["season_format"],
+                int(calendar["base_year"]),
             )
             if frame is None:
                 print(f"Skipping empty table: {table}")
@@ -527,6 +540,8 @@ def load_temporal_table(
     seasons: list[str],
     hours: list[str],
     index: pd.DatetimeIndex,
+    canonical_season_format: str,
+    base_year: int,
 ) -> tuple[pd.DataFrame | None, dict[str, ProfileMetadata]]:
     table = table_config["table"]
     key_columns = table_config["key_columns"]
@@ -547,7 +562,13 @@ def load_temporal_table(
     season_to_position = {value: position for position, value in enumerate(seasons)}
     hour_to_position = {value: position for position, value in enumerate(hours)}
     season_mapping = build_season_mapping(
-        connection, table, season_column, seasons
+        connection,
+        table,
+        season_column,
+        seasons,
+        table_config.get("source_season_format", canonical_season_format),
+        canonical_season_format,
+        base_year,
     )
     matrix = np.full((len(seasons) * len(hours), len(key_rows)), np.nan)
 
@@ -607,6 +628,9 @@ def build_season_mapping(
     table: str,
     season_column: str,
     canonical_seasons: list[str],
+    source_season_format: str,
+    canonical_season_format: str,
+    base_year: int,
 ) -> dict[str, str]:
     raw_seasons = {
         row[0]
@@ -616,28 +640,35 @@ def build_season_mapping(
     }
     canonical = set(canonical_seasons)
     mapping: dict[str, str] = {}
-    corrected: list[tuple[str, str]] = []
+    invalid: list[str] = []
     for raw_season in raw_seasons:
-        if raw_season in canonical:
-            mapping[raw_season] = raw_season
+        try:
+            parsed = datetime.strptime(
+                f"{base_year}-{raw_season}",
+                f"%Y-{source_season_format}",
+            )
+        except (TypeError, ValueError):
+            invalid.append(str(raw_season))
             continue
-        parts = str(raw_season).split("-")
-        swapped = "-".join(reversed(parts)) if len(parts) == 2 else ""
-        if swapped in canonical:
-            mapping[raw_season] = swapped
-            corrected.append((raw_season, swapped))
+        canonical_season = parsed.strftime(canonical_season_format)
+        if canonical_season in canonical:
+            mapping[raw_season] = canonical_season
 
     mapped = list(mapping.values())
     if len(mapping) != len(raw_seasons) or len(set(mapped)) != len(mapped):
         missing = sorted(raw_seasons - set(mapping))
         raise ValueError(
-            f'{table} season labels cannot be mapped uniquely to time_season. '
-            f"First unmapped labels: {missing[:10]}"
+            f'{table}.{season_column} cannot be mapped uniquely from '
+            f'{source_season_format} to the time_season calendar format '
+            f'{canonical_season_format}. First invalid or unmapped labels: '
+            f"{sorted(set(invalid + [str(value) for value in missing]))[:10]}"
         )
-    if corrected:
+    if source_season_format != canonical_season_format:
+        example = next(iter(sorted(raw_seasons)))
         print(
-            f"Normalized {len(corrected)} swapped day/month labels in {table}; "
-            f"example: {corrected[0][0]} -> {corrected[0][1]}"
+            f"Aligned all {len(mapping)} {table} season labels from "
+            f"{source_season_format} to {canonical_season_format}; "
+            f"example: {example} -> {mapping[example]}"
         )
     return mapping
 
@@ -901,6 +932,7 @@ def run_pyomo(
     seasons: list[str],
     hours: list[str],
     engine: str,
+    calendar: dict[str, Any],
     extreme_records: list[dict[str, Any]] | None = None,
 ) -> PyomoAcesResult:
     try:
@@ -959,6 +991,7 @@ def run_pyomo(
             seasons=seasons,
             hours=hours,
             engine=engine,
+            calendar=calendar,
         )
     forced_day_ids = sorted(
         {int(record["day_id"]) for record in extreme_records}
@@ -1143,6 +1176,7 @@ def build_extreme_audit_records(
     seasons: list[str],
     hours: list[str],
     engine: str,
+    calendar: dict[str, Any],
 ) -> list[dict[str, Any]]:
     hours_per_day = len(hours)
     is_pyomo = engine.startswith("pyomo")
@@ -1402,6 +1436,7 @@ def build_extreme_audit_records(
                 engine=engine,
                 selection_method=selection_method,
                 config=net_load_config,
+                calendar=calendar,
             )
         )
 
@@ -1560,6 +1595,7 @@ def build_net_load_ramp_records(
     engine: str,
     selection_method: str,
     config: dict[str, Any],
+    calendar: dict[str, Any],
 ) -> list[dict[str, Any]]:
     direction = str(config.get("direction", "absolute")).lower()
     if direction not in {"absolute", "upward", "downward"}:
@@ -1628,7 +1664,12 @@ def build_net_load_ramp_records(
             "must contain at least one technology."
         )
     segfrac = load_hourly_segfrac(
-        database, demand_config.get("segfrac", {}), seasons, hours
+        database,
+        demand_config.get("segfrac", {}),
+        seasons,
+        hours,
+        calendar["season_format"],
+        int(calendar["base_year"]),
     )
     calendar_hours = len(seasons) * len(hours)
     records: list[dict[str, Any]] = []
@@ -1773,6 +1814,8 @@ def load_hourly_segfrac(
     config: dict[str, Any],
     seasons: list[str],
     hours: list[str],
+    canonical_season_format: str,
+    base_year: int,
 ) -> np.ndarray:
     mode = config.get("mode", "database")
     if mode == "uniform_full_year":
@@ -1796,7 +1839,13 @@ def load_hourly_segfrac(
         f"file:{database.resolve()}?mode=ro", uri=True
     ) as connection:
         mapping = build_season_mapping(
-            connection, table, season_column, seasons
+            connection,
+            table,
+            season_column,
+            seasons,
+            config.get("source_season_format", canonical_season_format),
+            canonical_season_format,
+            base_year,
         )
         rows = connection.execute(
             f'SELECT "{season_column}", "{hour_column}", "{value_column}" '

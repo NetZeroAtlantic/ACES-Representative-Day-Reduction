@@ -11,9 +11,12 @@ dependencies:
   - scipy
   - scikit-learn
   - pyomo
+  - pyyaml
+  - highspy>=1.7
   - openpyxl
   - xlrd
   - jupyterlab
   - pip
   - pip:
       - seaborn
+      - tsam>=3.0

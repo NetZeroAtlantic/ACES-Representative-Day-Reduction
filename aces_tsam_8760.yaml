@@ -43,6 +43,10 @@ project:
 # ACES SCHEMA MAPPING
 # Change this section only when the input database uses different table or column names.
 aces:
+  # auto detects legacy ACES or Temoa v4 from the database. Use aces_legacy or
+  # temoa_v4 to require one schema and fail on an accidental mismatch.
+  schema: auto
+
   calendar:
     # Canonical ACES calendar used internally and written to the output database.
     season_table: time_season

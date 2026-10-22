@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import inspect
 import shutil
 import sqlite3
@@ -17,6 +18,7 @@ import yaml
 @dataclass
 class ProfileMetadata:
     table: str
+    logical_table: str
     key_columns: list[str]
     key_values: tuple[Any, ...]
     season_column: str
@@ -71,6 +73,8 @@ def main() -> None:
     database = resolve_path(
         config_path.parent, config["project"]["input_database"]
     )
+    config = configure_database_schema(database, config)
+    print(f'Using ACES database schema: {config["aces"]["schema"]}')
     if args.inspect:
         print(inspect_database(database).to_string(index=False))
         return
@@ -214,6 +218,7 @@ def main() -> None:
         metadata=metadata,
         seasons=seasons,
         hours=hours,
+        cluster_assignments=cluster_assignments,
     )
     write_audits(
         output_database.parent,
@@ -439,14 +444,231 @@ def validate_clustering_settings(
         raise ValueError(f"Invalid Pyomo forced day IDs: {invalid}")
 
 
-def load_config(path: Path) -> dict[str, Any]:
+def merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if (
+            key in merged
+            and isinstance(merged[key], dict)
+            and isinstance(value, dict)
+        ):
+            merged[key] = merge_config(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def load_config(path: Path, inherited: set[Path] | None = None) -> dict[str, Any]:
+    path = path.resolve()
+    inherited = set() if inherited is None else set(inherited)
+    if path in inherited:
+        raise ValueError(f"Circular YAML configuration inheritance: {path}")
+    inherited.add(path)
     with path.open(encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
     if not isinstance(config, dict):
         raise ValueError("The YAML configuration must contain a top-level mapping.")
+    parent = config.pop("extends", None)
+    if parent is not None:
+        parent_path = Path(parent)
+        if not parent_path.is_absolute():
+            parent_path = path.parent / parent_path
+        config = merge_config(load_config(parent_path, inherited), config)
     for section in ("project", "aces", "clustering"):
         if section not in config:
             raise ValueError(f"Missing required YAML section: {section}")
+    return config
+
+
+V4_TEMPORAL_TABLES: dict[str, dict[str, Any]] = {
+    "DemandSpecificDistribution": {
+        "table": "demand_specific_distribution",
+        "source_season_format": "%m-%d",
+        "season_column": "season",
+        "hour_column": "tod",
+        "value_column": "dsd",
+        "key_columns": ["region", "period", "demand_name"],
+        "preserve_columns": ["notes"],
+    },
+    "CapacityFactorTech": {
+        "table": "capacity_factor_tech",
+        "source_season_format": "%m-%d",
+        "season_column": "season",
+        "hour_column": "tod",
+        "value_column": "factor",
+        "key_columns": ["region", "tech"],
+        "preserve_columns": ["notes"],
+    },
+    "CapacityFactorProcess": {
+        "table": "capacity_factor_process",
+        "source_season_format": "%m-%d",
+        "season_column": "season",
+        "hour_column": "tod",
+        "value_column": "factor",
+        "key_columns": ["region", "tech", "vintage"],
+        "preserve_columns": ["notes"],
+    },
+    "EfficiencyVariable": {
+        "table": "efficiency_variable",
+        "source_season_format": "%m-%d",
+        "season_column": "season",
+        "hour_column": "tod",
+        "value_column": "efficiency",
+        "key_columns": [
+            "region", "input_comm", "tech", "vintage", "output_comm"
+        ],
+        "preserve_columns": ["notes"],
+    },
+    "CostVariableVariable": {
+        "table": "cost_variable_multiplier",
+        "source_season_format": "%m-%d",
+        "season_column": "season",
+        "hour_column": "tod",
+        "value_column": "multiplier",
+        "key_columns": ["region", "tech"],
+        "preserve_columns": ["notes"],
+    },
+}
+
+
+def detect_database_schema(database: Path) -> str:
+    if not database.exists():
+        raise FileNotFoundError(f"Input ACES database not found: {database}")
+    with sqlite3.connect(
+        f"file:{database.resolve()}?mode=ro", uri=True
+    ) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "metadata" in tables:
+            columns = {
+                row[1] for row in connection.execute('PRAGMA table_info("metadata")')
+            }
+            if {"element", "value"}.issubset(columns):
+                row = connection.execute(
+                    "SELECT value FROM metadata WHERE element = 'DB_MAJOR'"
+                ).fetchone()
+                if row is not None and int(row[0]) == 4:
+                    return "temoa_v4"
+        if "time_season" in tables:
+            columns = {
+                row[1]
+                for row in connection.execute('PRAGMA table_info("time_season")')
+            }
+            if {"season", "segment_fraction"}.issubset(columns):
+                return "temoa_v4"
+            if "t_season" in columns:
+                return "aces_legacy"
+        if "DemandSpecificDistribution" in tables:
+            return "aces_legacy"
+    raise ValueError(
+        "Could not identify the ACES database schema. Expected either legacy "
+        "ACES tables or Temoa metadata with DB_MAJOR=4."
+    )
+
+
+def configure_database_schema(
+    database: Path, original_config: dict[str, Any]
+) -> dict[str, Any]:
+    config = copy.deepcopy(original_config)
+    aces = config["aces"]
+    requested = str(aces.get("schema", "auto")).lower()
+    aliases = {
+        "legacy": "aces_legacy",
+        "aces": "aces_legacy",
+        "aces_current": "aces_legacy",
+        "v4": "temoa_v4",
+        "aces_temoa_v4": "temoa_v4",
+    }
+    requested = aliases.get(requested, requested)
+    if requested not in {"auto", "aces_legacy", "temoa_v4"}:
+        raise ValueError(
+            "aces.schema must be auto, aces_legacy, or temoa_v4."
+        )
+    detected = detect_database_schema(database)
+    if requested != "auto" and requested != detected:
+        raise ValueError(
+            f"Configured schema {requested!r} does not match detected schema "
+            f"{detected!r} in {database}."
+        )
+    aces["schema"] = detected
+    if detected == "aces_legacy":
+        for table in aces.get("temporal_tables", []):
+            table.setdefault("logical_table", table["table"])
+        aces.setdefault("weights", {})["mode"] = "hourly_table"
+        return config
+
+    aces["calendar"].update(
+        {
+            "season_table": "time_season",
+            "season_column": "season",
+            "hour_table": "time_of_day",
+            "hour_column": "tod",
+        }
+    )
+    aces["weights"] = {
+        "mode": "season_fraction",
+        "table": "time_season",
+        "season_column": "season",
+        "value_column": "segment_fraction",
+        "notes_column": "notes",
+        "sequence_column": "sequence",
+        "create_audit_table": aces.get("weights", {}).get(
+            "create_audit_table", True
+        ),
+        "audit_table": aces.get("weights", {}).get(
+            "audit_table", "RepresentativeDayWeight"
+        ),
+    }
+    aces["sequential_time"] = {
+        "table": "time_season_sequential",
+        "sequence_column": "sequence",
+        "label_column": "seas_seq",
+        "season_column": "season",
+        "value_column": "segment_fraction",
+        "notes_column": "notes",
+    }
+    for table in aces.get("temporal_tables", []):
+        logical = table.get("logical_table", table["table"])
+        table["logical_table"] = logical
+        mapping = V4_TEMPORAL_TABLES.get(logical)
+        if mapping is not None:
+            table.update(mapping)
+
+    for engine_name in ("tsam", "pyomo"):
+        engine = config.get("clustering", {}).get(engine_name, {})
+        net_load = engine.get("extremes", {}).get(
+            "include_max_net_load_ramp_day", {}
+        )
+        if not isinstance(net_load, dict):
+            continue
+        demand = net_load.setdefault("demand", {})
+        demand.update(
+            {
+                "annual_table": "demand",
+                "region_column": "region",
+                "period_column": "period",
+                "commodity_column": "commodity",
+                "value_column": "demand",
+                "unit_column": "units",
+            }
+        )
+        demand.setdefault("profile_table", "DemandSpecificDistribution")
+        demand["segfrac"] = {"mode": "calendar"}
+        generation = net_load.setdefault("existing_generation", {})
+        generation.update(
+            {
+                "capacity_table": "existing_capacity",
+                "region_column": "region",
+                "tech_column": "tech",
+                "value_column": "capacity",
+                "unit_column": "units",
+            }
+        )
+        generation.setdefault("capacity_factor_table", "CapacityFactorTech")
     return config
 
 
@@ -481,6 +703,32 @@ def load_aces_profiles(
             raise ValueError(
                 f"Expected {expected_hours} time_of_day rows, found {len(hours)}."
             )
+        if config["aces"].get("schema") == "temoa_v4":
+            season_fractions = [
+                float(row[0])
+                for row in connection.execute(
+                    'SELECT segment_fraction FROM "time_season"'
+                )
+            ]
+            tod_hours = [
+                float(row[0])
+                for row in connection.execute('SELECT hours FROM "time_of_day"')
+            ]
+            if (
+                any(value <= 0 for value in season_fractions)
+                or not np.isclose(sum(season_fractions), 1.0, atol=1e-8)
+            ):
+                raise ValueError(
+                    "Temoa v4 time_season.segment_fraction values must be "
+                    "positive and sum to 1."
+                )
+            if any(value <= 0 for value in tod_hours) or not np.isclose(
+                sum(tod_hours), 24.0, atol=1e-8
+            ):
+                raise ValueError(
+                    "Temoa v4 time_of_day.hours values must be positive and "
+                    "sum to 24."
+                )
 
         index = build_datetime_index(seasons, hours, calendar)
         frames: list[pd.DataFrame] = []
@@ -548,6 +796,7 @@ def load_temporal_table(
     base_year: int,
 ) -> tuple[pd.DataFrame | None, dict[str, ProfileMetadata]]:
     table = table_config["table"]
+    logical_table = table_config.get("logical_table", table)
     key_columns = table_config["key_columns"]
     season_column = table_config["season_column"]
     hour_column = table_config["hour_column"]
@@ -597,7 +846,7 @@ def load_temporal_table(
             )
             matrix[row_position, key_to_position[key]] = value
 
-    columns = [profile_name(table, key) for key in key_rows]
+    columns = [profile_name(logical_table, key) for key in key_rows]
     frame = pd.DataFrame(matrix, index=index, columns=columns)
     metadata: dict[str, ProfileMetadata] = {}
     for key, column in zip(key_rows, columns):
@@ -615,6 +864,7 @@ def load_temporal_table(
             preserve_values = tuple(preserve_row or [None] * len(preserve_columns))
         metadata[column] = ProfileMetadata(
             table=table,
+            logical_table=logical_table,
             key_columns=key_columns,
             key_values=tuple(key),
             season_column=season_column,
@@ -727,13 +977,13 @@ def select_clustering_columns(
             selected.append(column)
             weights[column] = float(overrides.get(column, 1.0))
             continue
-        if item.table not in included_tables or column in excluded_columns:
+        if item.logical_table not in included_tables or column in excluded_columns:
             continue
         keyed = {
             name: str(value)
             for name, value in zip(item.key_columns, item.key_values)
         }
-        if keyed.get("regions") in excluded_regions:
+        if (keyed.get("regions") or keyed.get("region")) in excluded_regions:
             continue
         if keyed.get("tech") in excluded_techs:
             continue
@@ -741,7 +991,7 @@ def select_clustering_columns(
             continue
         selected.append(column)
         weights[column] = float(
-            overrides.get(column, defaults.get(item.table, 1.0))
+            overrides.get(column, defaults.get(item.logical_table, 1.0))
         )
     if not selected:
         raise ValueError("Attribute filters selected zero clustering profiles.")
@@ -1267,7 +1517,7 @@ def build_extreme_audit_records(
             column
             for column in selected_columns
             if metadata.get(column) is not None
-            and metadata[column].table == "DemandSpecificDistribution"
+            and metadata[column].logical_table == "DemandSpecificDistribution"
         ]
         if demand_columns:
             demand = normalize_for_extreme_detection(
@@ -1302,7 +1552,7 @@ def build_extreme_audit_records(
             column
             for column in selected_columns
             if metadata.get(column) is not None
-            and metadata[column].table
+            and metadata[column].logical_table
             in {"CapacityFactorTech", "CapacityFactorProcess"}
             and "WIND" in column.upper()
         ]
@@ -1343,7 +1593,7 @@ def build_extreme_audit_records(
             column
             for column in selected_columns
             if metadata.get(column) is not None
-            and metadata[column].table == "DemandSpecificDistribution"
+            and metadata[column].logical_table == "DemandSpecificDistribution"
         ]
         available_regions = sorted(
             {
@@ -1550,7 +1800,16 @@ def normalize_for_extreme_detection(frame: pd.DataFrame) -> pd.DataFrame:
 
 def profile_key(metadata: ProfileMetadata, name: str) -> Any | None:
     keyed = dict(zip(metadata.key_columns, metadata.key_values))
-    return keyed.get(name)
+    aliases = {
+        "regions": ("regions", "region"),
+        "region": ("region", "regions"),
+        "periods": ("periods", "period"),
+        "period": ("period", "periods"),
+    }
+    for candidate in aliases.get(name, (name,)):
+        if candidate in keyed:
+            return keyed[candidate]
+    return None
 
 
 def ramp_rule_enabled(config: Any) -> bool:
@@ -1617,7 +1876,7 @@ def build_net_load_ramp_records(
     demand_columns = [
         column
         for column, item in metadata.items()
-        if item.table == demand_profile_table
+        if item.logical_table == demand_profile_table
         and str(profile_key(item, "demand_name")) == demand_commodity
     ]
     if not demand_columns:
@@ -1731,7 +1990,7 @@ def build_net_load_ramp_records(
                 cf_columns = [
                     column
                     for column, item in metadata.items()
-                    if item.table == cf_table
+                    if item.logical_table == cf_table
                     and str(profile_key(item, "regions")) == region
                     and str(profile_key(item, "tech")) == technology_name
                 ]
@@ -1828,9 +2087,49 @@ def load_hourly_segfrac(
             len(seasons) * len(hours),
             1.0 / (len(seasons) * len(hours)),
         )
+    if mode == "calendar":
+        with sqlite3.connect(
+            f"file:{database.resolve()}?mode=ro", uri=True
+        ) as connection:
+            season_weights = dict(
+                connection.execute(
+                    "SELECT season, segment_fraction FROM time_season"
+                ).fetchall()
+            )
+            hour_weights = dict(
+                connection.execute(
+                    "SELECT tod, hours FROM time_of_day"
+                ).fetchall()
+            )
+        missing_seasons = [season for season in seasons if season not in season_weights]
+        missing_hours = [hour for hour in hours if hour not in hour_weights]
+        if missing_seasons or missing_hours:
+            raise ValueError(
+                "Temoa v4 calendar weights are incomplete. Missing seasons: "
+                f"{missing_seasons[:10]}; missing hours: {missing_hours[:10]}."
+            )
+        total_hour_weight = sum(float(hour_weights[hour]) for hour in hours)
+        if total_hour_weight <= 0:
+            raise ValueError("Temoa v4 time_of_day.hours must sum to a positive value.")
+        values = np.asarray(
+            [
+                float(season_weights[season])
+                * float(hour_weights[hour])
+                / total_hour_weight
+                for season in seasons
+                for hour in hours
+            ],
+            dtype=float,
+        )
+        if np.any(values <= 0) or not np.isclose(values.sum(), 1.0, atol=1e-8):
+            raise ValueError(
+                "Temoa v4 calendar weights must be positive and sum to 1; "
+                f"found {values.sum()}."
+            )
+        return values
     if mode != "database":
         raise ValueError(
-            "Net-load demand.segfrac.mode must be database or "
+            "Net-load demand.segfrac.mode must be database, calendar, or "
             "uniform_full_year."
         )
     table = config.get("table", "SegFrac")
@@ -2116,6 +2415,7 @@ def write_reduced_database(
     metadata: dict[str, ProfileMetadata],
     seasons: list[str],
     hours: list[str],
+    cluster_assignments: list[int],
 ) -> Path:
     project = config["project"]
     output = resolve_path(base_directory, project["output_database"])
@@ -2148,38 +2448,102 @@ def write_reduced_database(
     }
     weight_config = config["aces"]["weights"]
     total_days = len(seasons)
+    if len(cluster_assignments) != total_days:
+        raise ValueError(
+            "Cluster assignments must contain one entry per source day; "
+            f"found {len(cluster_assignments)} for {total_days} days."
+        )
+    unknown_clusters = sorted(
+        {int(cluster) for cluster in cluster_assignments} - set(cluster_ids)
+    )
+    if unknown_clusters:
+        raise ValueError(
+            "Cluster assignments reference missing representative clusters: "
+            f"{unknown_clusters}"
+        )
 
     with sqlite3.connect(output) as connection:
         connection.execute("PRAGMA foreign_keys = OFF")
         calendar = config["aces"]["calendar"]
+        schema = config["aces"].get("schema", "aces_legacy")
+        if schema == "temoa_v4":
+            sequential = config["aces"]["sequential_time"]
+            connection.execute(f'DELETE FROM "{sequential["table"]}"')
         connection.execute(f'DELETE FROM "{calendar["season_table"]}"')
-        connection.executemany(
-            f'INSERT INTO "{calendar["season_table"]}" '
-            f'("{calendar["season_column"]}") VALUES (?)',
-            [(labels[cluster],) for cluster in cluster_ids],
-        )
-
-        connection.execute(f'DELETE FROM "{weight_config["table"]}"')
-        segfrac_rows = []
-        for cluster in cluster_ids:
-            weight = float(cluster_weights[cluster])
-            for hour in hours:
-                segfrac_rows.append(
-                    (
-                        labels[cluster],
-                        hour,
-                        weight / (total_days * len(hours)),
-                        f"Representative day weight={weight}",
-                    )
+        if weight_config.get("mode", "hourly_table") == "season_fraction":
+            season_rows = [
+                (
+                    position,
+                    labels[cluster],
+                    float(cluster_weights[cluster]) / total_days,
+                    f"Representative day weight={float(cluster_weights[cluster])}",
                 )
-        connection.executemany(
-            f'INSERT INTO "{weight_config["table"]}" '
-            f'("{weight_config["season_column"]}", '
-            f'"{weight_config["hour_column"]}", '
-            f'"{weight_config["value_column"]}", '
-            f'"{weight_config["notes_column"]}") VALUES (?, ?, ?, ?)',
-            segfrac_rows,
-        )
+                for position, cluster in enumerate(cluster_ids, start=1)
+            ]
+            connection.executemany(
+                f'INSERT INTO "{calendar["season_table"]}" '
+                f'("{weight_config["sequence_column"]}", '
+                f'"{calendar["season_column"]}", '
+                f'"{weight_config["value_column"]}", '
+                f'"{weight_config["notes_column"]}") VALUES (?, ?, ?, ?)',
+                season_rows,
+            )
+            width = max(3, len(str(total_days)))
+            sequential_rows = [
+                (
+                    position,
+                    f"S{position:0{width}d}",
+                    labels[int(cluster)],
+                    1.0 / total_days,
+                    "Original chronological day mapped to representative day",
+                )
+                for position, cluster in enumerate(cluster_assignments, start=1)
+            ]
+            connection.executemany(
+                f'INSERT INTO "{sequential["table"]}" '
+                f'("{sequential["sequence_column"]}", '
+                f'"{sequential["label_column"]}", '
+                f'"{sequential["season_column"]}", '
+                f'"{sequential["value_column"]}", '
+                f'"{sequential["notes_column"]}") VALUES (?, ?, ?, ?, ?)',
+                sequential_rows,
+            )
+            prune_v4_season_dependent_tables(
+                connection=connection,
+                selected_seasons=set(labels.values()),
+                rewritten_tables={item.table for item in metadata.values()},
+                excluded_tables={
+                    calendar["season_table"],
+                    sequential["table"],
+                },
+            )
+        else:
+            connection.executemany(
+                f'INSERT INTO "{calendar["season_table"]}" '
+                f'("{calendar["season_column"]}") VALUES (?)',
+                [(labels[cluster],) for cluster in cluster_ids],
+            )
+            connection.execute(f'DELETE FROM "{weight_config["table"]}"')
+            segfrac_rows = []
+            for cluster in cluster_ids:
+                weight = float(cluster_weights[cluster])
+                for hour in hours:
+                    segfrac_rows.append(
+                        (
+                            labels[cluster],
+                            hour,
+                            weight / (total_days * len(hours)),
+                            f"Representative day weight={weight}",
+                        )
+                    )
+            connection.executemany(
+                f'INSERT INTO "{weight_config["table"]}" '
+                f'("{weight_config["season_column"]}", '
+                f'"{weight_config["hour_column"]}", '
+                f'"{weight_config["value_column"]}", '
+                f'"{weight_config["notes_column"]}") VALUES (?, ?, ?, ?)',
+                segfrac_rows,
+            )
 
         if weight_config.get("create_audit_table", True):
             audit_table = weight_config.get(
@@ -2221,6 +2585,37 @@ def write_reduced_database(
         with sqlite3.connect(output) as connection:
             connection.execute("VACUUM")
     return output
+
+
+def prune_v4_season_dependent_tables(
+    connection: sqlite3.Connection,
+    selected_seasons: set[str],
+    rewritten_tables: set[str],
+    excluded_tables: set[str],
+) -> None:
+    """Remove source-date rows that cannot reference the reduced v4 calendar."""
+    tables = [
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    ]
+    placeholders = ", ".join("?" for _ in selected_seasons)
+    for table in tables:
+        if table in excluded_tables or table in rewritten_tables:
+            continue
+        columns = {
+            row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')
+        }
+        if "season" not in columns:
+            continue
+        if table.lower().startswith("output_"):
+            connection.execute(f'DELETE FROM "{table}"')
+        elif selected_seasons:
+            connection.execute(
+                f'DELETE FROM "{table}" WHERE "season" NOT IN ({placeholders})',
+                tuple(sorted(selected_seasons)),
+            )
 
 
 def insert_temporal_profiles(
@@ -2285,15 +2680,49 @@ def validate_output_database(database: Path, config: dict[str, Any]) -> None:
             if total is None or abs(float(total) - 1.0) > tolerance:
                 raise ValueError(f"Output SegFrac sum is {total}, expected 1.")
         if validation.get("require_dsd_sum_one", True):
-            rows = connection.execute(
-                "SELECT regions, periods, demand_name, SUM(dsd) "
-                "FROM DemandSpecificDistribution "
-                "GROUP BY regions, periods, demand_name "
-                "HAVING ABS(SUM(dsd) - 1.0) > ?",
-                (float(validation.get("dsd_sum_tolerance", 1e-8)),),
+            dsd_config = next(
+                (
+                    item
+                    for item in config["aces"]["temporal_tables"]
+                    if item.get("logical_table", item["table"])
+                    == "DemandSpecificDistribution"
+                    and item.get("enabled", True)
+                ),
+                None,
+            )
+            if dsd_config is not None:
+                keys = dsd_config["key_columns"]
+                quoted_keys = ", ".join(f'"{column}"' for column in keys)
+                rows = connection.execute(
+                    f'SELECT {quoted_keys}, SUM("{dsd_config["value_column"]}") '
+                    f'FROM "{dsd_config["table"]}" GROUP BY {quoted_keys} '
+                    f'HAVING ABS(SUM("{dsd_config["value_column"]}") - 1.0) > ?',
+                    (float(validation.get("dsd_sum_tolerance", 1e-8)),),
+                ).fetchall()
+                if rows:
+                    raise ValueError(
+                        f"Output DSD profiles do not sum to 1: {rows[:5]}"
+                    )
+        if config["aces"].get("schema") == "temoa_v4":
+            sequential = config["aces"]["sequential_time"]
+            sequential_total = connection.execute(
+                f'SELECT SUM("{sequential["value_column"]}") '
+                f'FROM "{sequential["table"]}"'
+            ).fetchone()[0]
+            tolerance = float(validation.get("segfrac_sum_tolerance", 1e-8))
+            if sequential_total is None or abs(float(sequential_total) - 1.0) > tolerance:
+                raise ValueError(
+                    "Output sequential-season fractions sum to "
+                    f"{sequential_total}, expected 1."
+                )
+            foreign_key_errors = connection.execute(
+                "PRAGMA foreign_key_check"
             ).fetchall()
-            if rows:
-                raise ValueError(f"Output DSD profiles do not sum to 1: {rows[:5]}")
+            if foreign_key_errors:
+                raise ValueError(
+                    "Output SQLite foreign-key validation failed: "
+                    f"{foreign_key_errors[:5]}"
+                )
         integrity = connection.execute("PRAGMA quick_check").fetchone()[0]
         if integrity != "ok":
             raise ValueError(f"Output SQLite quick_check failed: {integrity}")

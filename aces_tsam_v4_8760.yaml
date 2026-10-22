@@ -1,0 +1,367 @@
+#
+# Run:
+#   python run_aces_tsam.py aces_tsam_v4_8760.yaml --validate-only
+#   python run_aces_tsam.py aces_tsam_v4_8760.yaml
+
+project:
+  input_database: data/pypsa_canada_8760.sqlite
+  output_database: output/pypsa_canada_repdays_kmedoids_v4.sqlite
+  output_template_database: null
+  extra_attributes_directory: extra_attributes
+  overwrite_output: true
+  compact_output: true
+
+aces:
+  # auto detects the schema. temoa_v4 requires v4 and fails on a mismatch.
+  schema: temoa_v4
+
+  calendar:
+    season_table: time_season
+    season_column: season
+    season_format: "%m-%d"
+    # PyPSA weather/profile year. It is non-leap and contains 8,760 hours.
+    base_year: 2021
+    hour_table: time_of_day
+    hour_column: tod
+    hours_per_day: 24
+
+  # ---------------------------------------------------------------------------
+  # REPRESENTATIVE-DAY WEIGHTS: HOW OFTEN EACH SELECTED DAY OCCURS
+  # ---------------------------------------------------------------------------
+  # Clustering replaces the 365 original days with a smaller set of selected
+  # representative days. The weight of a representative day is the number of
+  # original days assigned to it divided by the total number of source days.
+  #
+  # Example: if 30 of the 365 original days are assigned to one representative
+  # day, its season fraction is 30 / 365 = 0.08219. Temoa uses this fraction to
+  # scale that representative day's hourly operation to its annual importance.
+  # In simplified form, an hourly contribution is weighted as:
+  #
+  #   representative-day fraction * hour duration / total modeled hours
+  #
+  # These weights therefore affect annual energy production, fuel use, variable
+  # operating cost, emissions, and annual demand. Incorrect weights can make a
+  # Temoa solution under- or over-estimate all of these quantities even when the
+  # representative profiles themselves look correct.
+  #
+  # For Temoa v4, the representative-day fraction is stored once for each
+  # representative season in time_season.segment_fraction. Older ACES/Temoa
+  # databases instead store a value for every season-hour pair in SegFrac;
+  # the runner handles that difference according to the selected schema.
+  #
+  # create_audit_table keeps a separate, human-readable record of cluster size
+  # and weight. It is useful for checking the reduction, but Temoa reads its
+  # operational weights from time_season, not from the audit table.
+  weights:
+    mode: season_fraction
+    table: time_season
+    season_column: season
+    value_column: segment_fraction
+    notes_column: notes
+    sequence_column: sequence
+    create_audit_table: true
+    audit_table: RepresentativeDayWeight
+
+  # ---------------------------------------------------------------------------
+  # SEQUENTIAL MAPPING: WHEN REPRESENTATIVE DAYS OCCUR DURING THE YEAR
+  # ---------------------------------------------------------------------------
+  # Weights say how frequently each representative day occurs; they do not say
+  # where those occurrences belong in chronological order. This table retains
+  # that missing information by creating one entry for every original day and
+  # mapping it to the representative season selected for its cluster.
+  #
+  # Example: source days 1, 2, and 3 may map to representative seasons S004,
+  # S011, and S004. The repeated S004 is intentional: it means the same selected
+  # profile represents both chronological positions. The complete output has
+  # 365 ordered mappings for a normal 8,760-hour year.
+  #
+  # This chronology matters most for storage and other inter-day constraints.
+  # It tells Temoa which representative day follows another so that inventory
+  # or state can be linked through the modeled year. Without it, independent
+  # representative days preserve annual totals through weights but cannot fully
+  # represent chronological carry-over between days.
+  #
+  # Keep this block enabled when the Temoa model uses representative-period
+  # sequencing (for example, time_sequencing = "representative_periods").
+  sequential_time:
+    table: time_season_sequential
+    sequence_column: sequence
+    label_column: seas_seq
+    season_column: season
+    value_column: segment_fraction
+    notes_column: notes
+
+  temporal_tables:
+    - logical_table: DemandSpecificDistribution
+      table: demand_specific_distribution
+      enabled: true
+      season_column: season
+      source_season_format: "%m-%d"
+      hour_column: tod
+      value_column: dsd
+      key_columns: [region, period, demand_name]
+      preserve_columns: [notes]
+      output_rule: weighted_and_normalized_to_one
+
+    - logical_table: CapacityFactorTech
+      table: capacity_factor_tech
+      enabled: true
+      season_column: season
+      source_season_format: "%m-%d"
+      hour_column: tod
+      value_column: factor
+      key_columns: [region, tech]
+      preserve_columns: [notes]
+      output_rule: representative_profile
+
+    - logical_table: CapacityFactorProcess
+      table: capacity_factor_process
+      enabled: true
+      season_column: season
+      source_season_format: "%m-%d"
+      hour_column: tod
+      value_column: factor
+      key_columns: [region, tech, vintage]
+      preserve_columns: [notes]
+      output_rule: representative_profile
+
+    - logical_table: EfficiencyVariable
+      table: efficiency_variable
+      enabled: true
+      season_column: season
+      source_season_format: "%m-%d"
+      hour_column: tod
+      value_column: efficiency
+      key_columns: [region, input_comm, tech, vintage, output_comm]
+      preserve_columns: [notes]
+      output_rule: representative_profile
+
+    - logical_table: CostVariableVariable
+      table: cost_variable_multiplier
+      enabled: false
+      season_column: season
+      source_season_format: "%m-%d"
+      hour_column: tod
+      value_column: multiplier
+      key_columns: [region, tech]
+      preserve_columns: [notes]
+      output_rule: representative_profile
+
+clustering:
+  # tsam uses statistical clustering. Change to pyomo for duration-curve
+  # optimization using the complete pyomo section below.
+  engine: tsam
+  n_representative_days: 60
+
+  attributes:
+    # These logical names remain stable between legacy ACES and Temoa v4.
+    table_default_weights:
+      DemandSpecificDistribution: 5.0
+      CapacityFactorTech: 1.0
+      CapacityFactorProcess: 1.0
+      EfficiencyVariable: 0.0
+      CostVariableVariable: 0.0
+
+    include:
+      tables:
+        - DemandSpecificDistribution
+        - CapacityFactorTech
+        - CapacityFactorProcess
+      extra_attributes: []
+
+    exclude:
+      regions: []
+      technologies: []
+      demands: []
+      columns: []
+
+    # Example:
+    # column_weight_overrides:
+    #   "DemandSpecificDistribution|AB_Central|2025|D_ELEC": 8.0
+    column_weight_overrides: {}
+
+  # --------------------------------------------------------------------------
+  # TSAM / K-MEDOIDS SETTINGS
+  # --------------------------------------------------------------------------
+  tsam:
+    period_duration: 24
+    temporal_resolution: 1h
+
+    cluster:
+      method: kmedoids
+      representation:
+        # Required so each output period is a complete historical day.
+        type: medoid
+      normalize_column_means: true
+      use_duration_curves: false
+      include_period_sums: true
+      # HiGHS is open source. cplex or gurobi may be faster when available.
+      solver: cplex
+
+    extremes:
+     
+      # Add minimum-wind historical days as new cluster centers. The final
+      # number can exceed 15 because regional extremes may occur on different days.
+      enabled: true
+      method: new_cluster
+      max_value: []
+      min_value: []
+      max_period: []
+      min_period:
+        - "CapacityFactorTech|AB_Central|E_WIND-ON_EX"
+        - "CapacityFactorTech|AB_South|E_WIND-ON_EX"
+        - "CapacityFactorTech|BC_North|E_WIND-ON_EX"
+        - "CapacityFactorTech|BC_South|E_WIND-ON_EX"
+        - "CapacityFactorTech|MB|E_WIND-ON_EX"
+        - "CapacityFactorTech|NB_East|E_WIND-ON_EX"
+        - "CapacityFactorTech|NB_West|E_WIND-ON_EX"
+        - "CapacityFactorTech|NL_Newfoundland|E_WIND-ON_EX"
+        - "CapacityFactorTech|NS_East|E_WIND-ON_EX"
+        - "CapacityFactorTech|NS_West|E_WIND-ON_EX"
+        - "CapacityFactorTech|ON_East|E_WIND-ON_EX"
+        - "CapacityFactorTech|ON_North|E_WIND-ON_EX"
+        - "CapacityFactorTech|ON_Northwest|E_WIND-ON_EX"
+        - "CapacityFactorTech|ON_South|E_WIND-ON_EX"
+        - "CapacityFactorTech|PE|E_WIND-ON_EX"
+        - "CapacityFactorTech|QC_Central|E_WIND-ON_EX"
+        - "CapacityFactorTech|QC_East|E_WIND-ON_EX"
+        - "CapacityFactorTech|QC_South|E_WIND-ON_EX"
+        - "CapacityFactorTech|SK|E_WIND-ON_EX"
+      custom_marker_weight: 1.0e-6
+
+      include_max_daily_ramp_day:
+        enabled: false
+        reference_period: first_model_period
+        regions: all
+        direction: absolute
+
+      include_max_net_load_ramp_day:
+        enabled: true
+        reference_period: first_model_period
+        regions: all
+        direction: absolute
+
+        demand:
+          annual_table: demand
+          region_column: region
+          period_column: period
+          commodity_column: commodity
+          value_column: demand
+          unit_column: units
+          commodity: D_ELEC
+          profile_table: DemandSpecificDistribution
+          segfrac:
+            # Reads time_season.segment_fraction and time_of_day.hours in v4.
+            mode: calendar
+
+        existing_generation:
+          capacity_table: existing_capacity
+          region_column: region
+          tech_column: tech
+          value_column: capacity
+          unit_column: units
+          capacity_factor_table: CapacityFactorTech
+          technologies:
+            - tech: E_WIND-ON_EX
+              capacity_factor_table: CapacityFactorTech
+            - tech: E_SOLPV-CEN_EX
+              capacity_factor_table: CapacityFactorTech
+
+    segmentation:
+      enabled: false
+      n_segments: 24
+      representation:
+        type: mean
+
+    aggregate:
+      preserve_column_means: false
+      rescale_exclude_columns: []
+      round_decimals: 5
+      numerical_tolerance: 0.001
+
+  # --------------------------------------------------------------------------
+  # OPTIONAL PYOMO DURATION-CURVE ENGINE
+  # Used only when clustering.engine is changed to pyomo.
+  # --------------------------------------------------------------------------
+  pyomo:
+    solution_method: hybrid_random_weighting
+    formulation: milp
+    use_integer_weights: false
+    fixed_day_ids: []
+    n_bins: 30
+    normalization: minmax
+    n_random_iterations: 10
+    random_seed: 40
+    sampled_candidate_pool_size: null
+
+    candidate_reduction_method: ward_nearest_day
+    candidate_feature_mode: chronological_daily_profile
+    n_candidate_days: 250
+    forced_day_ids: []
+
+    extremes:
+      enabled: false
+      selection_mode: force_within_count
+      max_value: []
+      min_value: []
+      max_period: []
+      min_period: []
+      include_peak_demand_day: false
+      include_min_wind_day: false
+
+      include_max_daily_ramp_day:
+        enabled: false
+        reference_period: first_model_period
+        regions: all
+        direction: absolute
+
+      include_max_net_load_ramp_day:
+        enabled: false
+        reference_period: first_model_period
+        regions: all
+        direction: absolute
+
+        demand:
+          annual_table: demand
+          region_column: region
+          period_column: period
+          commodity_column: commodity
+          value_column: demand
+          unit_column: units
+          commodity: D_ELEC
+          profile_table: DemandSpecificDistribution
+          segfrac:
+            mode: calendar
+
+        existing_generation:
+          capacity_table: existing_capacity
+          region_column: region
+          tech_column: tech
+          value_column: capacity
+          unit_column: units
+          capacity_factor_table: CapacityFactorTech
+          technologies:
+            - E_WIND-ON_EX
+
+    enforce_positive_weight: true
+    minimum_weight: 1.0
+
+    solver:
+      name: cplex
+      time_limit_seconds: 300
+      mip_gap: 0.001
+      threads: 6
+      tee: true
+
+validation:
+  require_dsd_sum_one: true
+  dsd_sum_tolerance: 1.0e-8
+  require_segfrac_sum_one: true
+  segfrac_sum_tolerance: 1.0e-8
+  # Empty optional v4 tables, such as efficiency_variable in this database,
+  # are skipped instead of failing validation.
+  fail_on_missing_temporal_table: false
+
+outputs:
+  write_excel_audit: true
+  write_accuracy_metrics: true

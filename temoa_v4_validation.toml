@@ -1,0 +1,22 @@
+# Build-only validation of the database created by aces_tsam_v4_8760.yaml.
+scenario = "repday_validation"
+scenario_mode = "perfect_foresight"
+input_database = "output/pypsa_canada_repdays_v4.sqlite"
+output_database = "output/pypsa_canada_repdays_v4.sqlite"
+
+solver = "appsi_highs"
+neos = false
+save_excel = false
+save_duals = false
+save_storage_levels = false
+save_lp_file = false
+
+price_check = false
+source_trace = false
+check_units = false
+plot_commodity_network = false
+graphviz_output = false
+
+time_sequencing = "representative_periods"
+days_per_period = 365
+reserve_margin = "dynamic"

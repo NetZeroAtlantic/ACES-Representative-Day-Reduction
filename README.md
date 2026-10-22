@@ -13,6 +13,7 @@ The input database is never modified. The reduced database and audit files are w
 |---|---|
 | `README.md` | Project setup, configuration, and method guide. |
 | `aces_tsam_8760.yaml` | Main configuration file. Select the engine and edit all run settings here. |
+| `aces_tsam_8760_v4.yaml` | Another configuration file that tests the temoa-v4 schema. |
 | `run_aces_tsam.py` | Reads ACES tables, runs the selected method, and writes the reduced database. |
 | `repday/` | Duration-curve optimization models, candidate reduction, preprocessing, metrics, and plots. |
 | `extra_attributes/` | Optional hourly CSV or Excel files containing temperature, humidity, or other clustering inputs. |
@@ -43,7 +44,40 @@ project:
   input_database: data/Offshore_wind_NS-NB.sqlite
 ```
 
-The database must contain the ACES calendar tables and the enabled temporal tables listed under `aces.temporal_tables`. The current calendar configuration expects 366 days and hourly labels `H00` through `H23`.
+The database must contain the ACES calendar tables and the enabled temporal tables listed under `aces.temporal_tables`. A full-year database may contain 365 or 366 days; the current workflow expects hourly labels `H00` through `H23`.
+
+### Legacy ACES and Temoa v4 schemas
+
+The runner supports both the legacy ACES schema and Temoa database schema v4.
+Set `aces.schema` to one of:
+
+- `auto` to detect the schema from database metadata and table signatures.
+- `aces_legacy` to require the legacy ACES schema.
+- `temoa_v4` to require Temoa v4 and fail if another schema is supplied.
+
+The logical profile names used by clustering settings remain stable across both
+schemas (`DemandSpecificDistribution`, `CapacityFactorTech`, and so on). The
+v4 adapter maps those names to lowercase v4 tables and columns, writes
+representative weights to `time_season.segment_fraction`, and rebuilds
+`time_season_sequential` from the chronological cluster assignments.
+
+Please note that this repo is under continoius development and bug fixing
+
+```powershell
+python run_aces_tsam.py aces_tsam_v4_8760.yaml --validate-only
+python run_aces_tsam.py aces_tsam_v4_8760.yaml
+python -m temoa validate temoa_v4_validation.toml
+```
+
+The v4 configuration uses `extends: aces_tsam_8760.yaml`, so it inherits the
+shared clustering settings while overriding only the database, output, schema,
+solver, and dataset-specific extreme-day choices. Configuration inheritance is
+recursive, and child mappings override matching parent values.
+
+`temoa_v4_validation.toml` performs Temoa's own build-only validation against
+the generated database using `representative_periods` sequencing. This final
+check can also reveal unrelated static-data problems already present in the
+source database.
 
 ### Date formats
 
@@ -67,7 +101,6 @@ aces:
       source_season_format: "%m-%d"  # CF uses month-day
 ```
 
-Do not select a format by looking only at labels such as `01-04`, because that string is valid in both orders. An incorrect format now fails validation when possible instead of swapping only unambiguous dates.
 
 ## 2. Install Dependencies
 
@@ -99,7 +132,7 @@ The output database path is controlled by:
 
 ```yaml
 project:
-  output_database: output/Offshore_wind_NS-NB_repdays_actual_dates.sqlite
+  output_database: output/yourdatabase.sqlite
 ```
 
 `overwrite_output: true` replaces an older output with the same name. It does not modify the input database.
@@ -199,7 +232,7 @@ aggregate:
 
 If segmentation is enabled, `n_segments` must remain 24 because ACES expects `H00` through `H23`.
 
-## Duration-Curve Optimization Engine
+## Duration-Curve Optimization Engine [ this has not been tested with the temoa-v4 schema TODO]
 
 Set `clustering.engine: pyomo`. The model divides every selected profile into `n_bins` value thresholds. At each threshold it compares the share of full-year hours above the threshold with the share represented by the weighted selected days. It minimizes the weighted sum of the absolute differences.
 

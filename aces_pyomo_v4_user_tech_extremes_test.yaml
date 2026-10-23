@@ -1,0 +1,98 @@
+# Pyomo test with capacity- and demand-weighted, user-defined technologies.
+#
+# Run:
+#   python run_aces_tsam.py aces_pyomo_v4_user_tech_extremes_test.yaml --validate-only
+#   python run_aces_tsam.py aces_pyomo_v4_user_tech_extremes_test.yaml
+extends: aces_tsam_v4_8760.yaml # contain all the major data and configuration for this test and addtional configuration below, extends the base configuration with user-defined technologies and extremes.
+
+project:
+  output_database: output/canada_repdays_pyomo_user_tech_v4.sqlite
+  overwrite_output: true
+
+clustering:
+  engine: pyomo
+  n_representative_days: 8
+
+  pyomo:
+    solution_method: hybrid_random_weighting
+    formulation: milp
+    use_integer_weights: false
+    n_bins: 10
+    normalization: minmax
+    n_random_iterations: 2
+    random_seed: 40
+    sampled_candidate_pool_size: 30
+
+    candidate_reduction_method: ward_nearest_day
+    candidate_feature_mode: chronological_daily_profile
+    n_candidate_days: 30
+    forced_day_ids: []
+
+    extremes:
+      enabled: true
+      selection_mode: force_within_count
+      # Sparse trade-demand distributions must retain at least one nonzero
+      # source day so their reduced Temoa DSD rows can still normalize to one.
+      max_value:
+        - "DemandSpecificDistribution|AB_South|2025|D_ELEC_EXPORT_AB_SOUTH_US_TRADE"
+        - "DemandSpecificDistribution|QC_East|2025|D_ELEC_EXPORT_QC_EAST_US_TRADE"
+        - "DemandSpecificDistribution|SK|2025|D_ELEC_EXPORT_SK_US_TRADE"
+      min_value: []
+      max_period: []
+      min_period: []
+
+      # SYSTEM-WIDE: sum all regions before selecting each enabled extreme.
+      system_wide:
+        enabled: true
+        reference_period: first_model_period
+        regions: all
+
+        include_peak_demand_day:
+          enabled: false
+
+        include_min_wind_day:
+          enabled: false
+
+        include_peak_net_load_day:
+          enabled: true
+          technologies:
+            - tech: E_WIND-ON_EX
+              capacity_factor_table: CapacityFactorTech
+            - tech: E_SOLPV-CEN_EX
+              capacity_factor_table: CapacityFactorTech
+
+        # Every group is a separate extreme. This test explicitly checks wind,
+        # solar, and their combined available-generation minimum.
+        include_min_generation_period:
+          enabled: true
+          groups:
+            - name: wind
+              technologies: [E_WIND-ON_EX]
+            - name: solar
+              technologies: [E_SOLPV-CEN_EX]
+            - name: wind_plus_solar
+              technologies: [E_WIND-ON_EX, E_SOLPV-CEN_EX]
+
+        include_max_daily_ramp_day:
+          enabled: false
+
+        include_max_net_load_ramp_day:
+          enabled: false
+
+      # SUBSYSTEM: enable to select the same rules independently per region.
+      subsystem:
+        enabled: false
+
+    enforce_positive_weight: true
+    minimum_weight: 1.0
+
+    solver:
+      name: highs
+      time_limit_seconds: null
+      mip_gap: null
+      threads: null
+      tee: true
+
+outputs:
+  write_excel_audit: true
+  write_accuracy_metrics: true

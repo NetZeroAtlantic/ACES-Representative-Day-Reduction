@@ -4,8 +4,8 @@
 #   python run_aces_tsam.py aces_tsam_v4_8760.yaml
 
 project:
-  input_database: data/pypsa_canada_8760.sqlite
-  output_database: output/pypsa_canada_repdays_kmedoids_v4.sqlite
+  input_database: data/canada_8760.sqlite
+  output_database: output/canada_repdays_kmedoids_v4.sqlite
   output_template_database: null
   extra_attributes_directory: extra_attributes
   overwrite_output: true
@@ -151,7 +151,7 @@ clustering:
   # tsam uses statistical clustering. Change to pyomo for duration-curve
   # optimization using the complete pyomo section below.
   engine: tsam
-  n_representative_days: 60
+  n_representative_days: 30
 
   attributes:
     # These logical names remain stable between legacy ACES and Temoa v4.
@@ -202,7 +202,7 @@ clustering:
      
       # Add minimum-wind historical days as new cluster centers. The final
       # number can exceed 15 because regional extremes may occur on different days.
-      enabled: true
+      enabled: false
       method: new_cluster
       max_value: []
       min_value: []
@@ -227,7 +227,7 @@ clustering:
         - "CapacityFactorTech|QC_East|E_WIND-ON_EX"
         - "CapacityFactorTech|QC_South|E_WIND-ON_EX"
         - "CapacityFactorTech|SK|E_WIND-ON_EX"
-      custom_marker_weight: 1.0e-6
+      custom_marker_weight: 1.0e-6 # Tiny internal weight used to force custom extreme/ramp days into TSAM without materially affecting clustering distances or Temoa outputs
 
       include_max_daily_ramp_day:
         enabled: false
@@ -268,7 +268,7 @@ clustering:
               capacity_factor_table: CapacityFactorTech
 
     segmentation:
-      enabled: false
+      enabled: false  # Keep all 24 hourly time steps in every representative day; no within-day averaging or compression is applied.
       n_segments: 24
       representation:
         type: mean
@@ -302,24 +302,101 @@ clustering:
     extremes:
       enabled: false
       selection_mode: force_within_count
+
+      # PROFILE-SPECIFIC EXTREMES
+      # Every entry is evaluated independently. A list never sums its profiles.
+      # Example: two max_value entries can select two different source days.
       max_value: []
       min_value: []
       max_period: []
       min_period: []
-      include_peak_demand_day: false
-      include_min_wind_day: false
 
-      include_max_daily_ramp_day:
+      # SYSTEM-WIDE EXTREMES
+      # All selected regions are summed first, then each enabled rule selects
+      # one system extreme. Listed technologies are capacity weighted and summed.
+      system_wide:
         enabled: false
         reference_period: first_model_period
         regions: all
-        direction: absolute
 
-      include_max_net_load_ramp_day:
+        demand:
+          annual_table: demand
+          region_column: region
+          period_column: period
+          commodity_column: commodity
+          value_column: demand
+          unit_column: units
+          commodity: D_ELEC
+          profile_table: DemandSpecificDistribution
+          segfrac:
+            mode: calendar
+        existing_generation:
+          capacity_table: existing_capacity
+          region_column: region
+          tech_column: tech
+          value_column: capacity
+          unit_column: units
+          capacity_factor_table: CapacityFactorTech
+
+        include_peak_demand_day:
+          enabled: false
+
+        include_min_wind_day:
+          enabled: false
+          technologies:
+            - tech: E_WIND-ON_EX
+              capacity_factor_table: CapacityFactorTech
+
+        include_peak_net_load_day:
+          enabled: false
+          technologies:
+            - tech: E_WIND-ON_EX
+              capacity_factor_table: CapacityFactorTech
+            - tech: E_SOLPV-CEN_EX
+              capacity_factor_table: CapacityFactorTech
+
+        # Each named group creates its own minimum-generation extreme. Keep only
+        # wind_plus_solar for one combined event, or enable wind and solar groups
+        # as shown to select their minima separately.
+        include_min_generation_period:
+          enabled: false
+          groups:
+            - name: wind
+              technologies:
+                - tech: E_WIND-ON_EX
+                  capacity_factor_table: CapacityFactorTech
+            - name: solar
+              technologies:
+                - tech: E_SOLPV-CEN_EX
+                  capacity_factor_table: CapacityFactorTech
+            - name: wind_plus_solar
+              technologies:
+                - tech: E_WIND-ON_EX
+                  capacity_factor_table: CapacityFactorTech
+                - tech: E_SOLPV-CEN_EX
+                  capacity_factor_table: CapacityFactorTech
+
+        include_max_daily_ramp_day:
+          enabled: false
+          direction: absolute
+
+        include_max_net_load_ramp_day:
+          enabled: false
+          direction: absolute
+          technologies:
+            - tech: E_WIND-ON_EX
+              capacity_factor_table: CapacityFactorTech
+            - tech: E_SOLPV-CEN_EX
+              capacity_factor_table: CapacityFactorTech
+
+      # SUBSYSTEM EXTREMES
+      # Each selected region is evaluated independently. regions: all means one
+      # extreme calculation per region, not one sum of all regions. Duplicate
+      # dates selected by different regions or rules occupy only one day slot.
+      subsystem:
         enabled: false
         reference_period: first_model_period
         regions: all
-        direction: absolute
 
         demand:
           annual_table: demand
@@ -340,8 +417,39 @@ clustering:
           value_column: capacity
           unit_column: units
           capacity_factor_table: CapacityFactorTech
+
+        include_peak_demand_day:
+          enabled: false
+
+        include_min_wind_day:
+          enabled: false
           technologies:
             - E_WIND-ON_EX
+
+        include_peak_net_load_day:
+          enabled: false
+          technologies:
+            - E_WIND-ON_EX
+            - E_SOLPV-CEN_EX
+
+        include_min_generation_period:
+          enabled: false
+          groups:
+            - name: wind
+              technologies: [E_WIND-ON_EX]
+            - name: solar
+              technologies: [E_SOLPV-CEN_EX]
+            - name: wind_plus_solar
+              technologies: [E_WIND-ON_EX, E_SOLPV-CEN_EX]
+
+        include_max_daily_ramp_day:
+          enabled: false
+          direction: absolute
+
+        include_max_net_load_ramp_day:
+          enabled: false
+          direction: absolute
+          technologies: [E_WIND-ON_EX, E_SOLPV-CEN_EX]
 
     enforce_positive_weight: true
     minimum_weight: 1.0

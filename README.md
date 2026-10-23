@@ -13,7 +13,10 @@ The input database is never modified. The reduced database and audit files are w
 |---|---|
 | `README.md` | Project setup, configuration, and method guide. |
 | `aces_tsam_8760.yaml` | Main configuration file. Select the engine and edit all run settings here. |
-| `aces_tsam_8760_v4.yaml` | Another configuration file that tests the temoa-v4 schema. |
+| `aces_tsam_v4_8760.yaml` | Detailed standalone PyPSA Canada configuration for the Temoa v4 schema. |
+| `aces_pyomo_v4_subsystem_extremes_test.yaml` | PyPSA Canada test that selects physically weighted extremes independently for example regions. |
+| `aces_pyomo_v4_smoke_test.yaml` | Small Pyomo v4 test using physically weighted system-wide extremes. |
+| `aces_pyomo_v4_user_tech_extremes_test.yaml` | Small Pyomo v4 test using physical net load and user-selected existing-generation technologies. |
 | `run_aces_tsam.py` | Reads ACES tables, runs the selected method, and writes the reduced database. |
 | `repday/` | Duration-curve optimization models, candidate reduction, preprocessing, metrics, and plots. |
 | `extra_attributes/` | Optional hourly CSV or Excel files containing temperature, humidity, or other clustering inputs. |
@@ -232,11 +235,71 @@ aggregate:
 
 If segmentation is enabled, `n_segments` must remain 24 because ACES expects `H00` through `H23`.
 
-## Duration-Curve Optimization Engine [ this has not been tested with the temoa-v4 schema TODO]
+## Pyomo Duration-Curve Optimization Engine
 
 Set `clustering.engine: pyomo`. The model divides every selected profile into `n_bins` value thresholds. At each threshold it compares the share of full-year hours above the threshold with the share represented by the weighted selected days. It minimizes the weighted sum of the absolute differences.
 
 Increasing `n_bins` describes the annual duration curves in more detail but increases model size and runtime.
+
+This engine has been exercised with the PyPSA Canada Temoa v4 database. The
+small test configurations are:
+
+| Configuration | Purpose |
+|---|---|
+| `aces_pyomo_v4_smoke_test.yaml` | Fast eight-day test using annual-demand-weighted peak demand and capacity-weighted minimum wind generation. |
+| `aces_pyomo_v4_user_tech_extremes_test.yaml` | Fast eight-day test using actual annual demand, installed capacity, and user-selected wind and solar technologies. |
+
+These are smoke tests, not recommended production-quality searches. Increase
+the candidate count, random iterations, duration-curve bins, and possibly the
+representative-day count before using the result for final modelling.
+
+### Main Pyomo Options
+
+| Option | Meaning and effect |
+|---|---|
+| `n_representative_days` | Total number of selected days. Pyomo forced extremes are included inside this number rather than added afterward. |
+| `solution_method` | `opt` solves the requested selection in one optimization model. `hybrid_random_weighting` tests multiple randomly chosen day sets, optimizes their weights, and retains the best set. |
+| `formulation` | `milp` allows the model or hybrid search to select days. `lp_fixed_days` accepts exactly the dates in `fixed_day_ids` and optimizes only their weights. |
+| `use_integer_weights` | When `true`, every representative-day weight is a whole number of source days. When `false`, fractional occurrence weights are allowed. |
+| `n_bins` | Number of thresholds used to approximate each annual duration curve. More bins improve detail but increase rows, variables, memory use, and runtime. Values around 10 are useful for smoke tests; production runs should compare several larger values. |
+| `normalization` | Scales each profile before calculating errors so profiles with large numerical units do not dominate automatically. Supported modes are `minmax`, `zscore`, `robust`, and `none`. Profile weights still apply after normalization. |
+| `random_seed` | Makes candidate reduction and hybrid day sampling reproducible. The same data, configuration, dependency versions, and seed should produce the same sampled combinations. |
+| `fixed_day_ids` | One-based source-day positions used by `lp_fixed_days`; day 1 is the first season in the input calendar. |
+| `forced_day_ids` | Additional one-based source-day positions that must be selected. Prefer named extreme rules when possible because their audit records explain why each day was forced. |
+| `enforce_positive_weight` | Prevents a selected day from receiving zero weight. Usually keep this enabled. |
+| `minimum_weight` | Minimum occurrence weight for every selected day when positive weights are enforced. A value of `1.0` means at least one source-day equivalent. |
+
+Example lightweight settings:
+
+```yaml
+clustering:
+  engine: pyomo
+  n_representative_days: 8
+
+  pyomo:
+    solution_method: hybrid_random_weighting
+    formulation: milp
+    use_integer_weights: false
+    n_bins: 10
+    normalization: minmax
+    n_random_iterations: 2
+    random_seed: 40
+    sampled_candidate_pool_size: 30
+
+    candidate_reduction_method: ward_nearest_day
+    candidate_feature_mode: chronological_daily_profile
+    n_candidate_days: 30
+
+    enforce_positive_weight: true
+    minimum_weight: 1.0
+```
+
+For `hybrid_random_weighting`, `n_random_iterations` is the number of unique
+day combinations to solve. Increasing it searches more possibilities but adds
+approximately one weight-optimization solve per iteration.
+`sampled_candidate_pool_size` optionally draws a smaller reproducible pool from
+the candidate days before combinations are generated. It must contain enough
+non-forced days to fill the requested representative-day count.
 
 ### Solution Methods and Valid Combinations
 
@@ -284,15 +347,281 @@ Candidate feature modes:
 
 Pyomo extreme days count inside `n_representative_days`. If N is 15 and five unique extremes are forced, the method selects those five plus ten other days.
 
-Supported controls are exact profile rules (`max_value`, `min_value`, `max_period`, and `min_period`), system rules (`include_peak_demand_day`, `include_min_wind_day`, and `include_max_daily_ramp_day`), and manual one-based IDs under `forced_day_ids`.
+The exact-profile rules accept generated profile names such as
+`CapacityFactorTech|AB_Central|E_WIND-ON_EX`:
 
-`include_max_daily_ramp_day` can force one demand-ramp day for each selected region. Set `reference_period` to `first_model_period` or an explicit ACES period, set `regions` to `all` or a list, and choose `direction: absolute`, `upward`, or `downward`. The calculation combines the selected DSD profiles within each region after normalizing their shapes. It compares H00-H01 through H22-H23 and does not compare H23 with the following day's H00.
+| Rule | Day that is forced |
+|---|---|
+| `max_value` | Day containing the profile's highest individual hourly value. |
+| `min_value` | Day containing the profile's lowest individual hourly value. |
+| `max_period` | Day having the largest sum of its 24 hourly profile values. |
+| `min_period` | Day having the smallest sum of its 24 hourly profile values. This is commonly used for a named wind-capacity-factor profile. |
 
-`include_max_net_load_ramp_day` provides a separate regional net-load rule. It calculates actual hourly electricity demand from `Demand`, `DemandSpecificDistribution`, and `SegFrac`. It then sums every `ExistingCapacity` vintage for each configured technology and multiplies that capacity by its `CapacityFactorTech` profile. The resulting screening profile is `actual demand - available existing generation`. This is available generation, not optimized dispatch. Table names, column names, demand commodity, regions, reference period, technologies, CF table, and ramp direction are editable in YAML.
+Each listed profile is evaluated independently. Listing wind profiles for 19
+regions can therefore force as many as 19 different days. Duplicate dates count
+only once. Validation stops if the number of unique forced dates is greater
+than `n_representative_days`.
 
-The net-load calculation supports annual demand in PJ, TWh, GWh, or MWh and existing capacity in GW, MW, or kW. Use `segfrac.mode: uniform_full_year` when every source hour has equal duration. Use `segfrac.mode: database` only when the input contains one positive `SegFrac` row per source hour and those values sum to one. A technology with zero recorded capacity in a region contributes zero. A technology with positive capacity must have exactly one matching hourly CF profile in the configured temporal table.
+Calculated Pyomo extremes use the explicit `system_wide` and `subsystem`
+sections documented below. Both use annual-demand weighting and existing-
+capacity weighting; the scope determines whether selected regions are summed
+or evaluated independently. Calculated rules placed directly under
+`pyomo.extremes` are rejected; this prevents an old configuration from running
+with unclear region-aggregation behavior.
 
-If multiple rules select the same date, it counts once but every reason is retained in the audit output.
+### Complete Pyomo Extreme-Option Reference
+
+Pyomo extremes are divided into two deliberately different categories:
+
+1. **Profile-specific extremes** inspect each exact profile independently.
+2. **Physically weighted calculated extremes** can be evaluated either for one
+   combined system or independently for every selected regional subsystem.
+
+All unique dates selected by these rules count inside
+`n_representative_days`. If several profiles, regions, technology groups, or
+rules select the same date, the date occupies one place while every reason is
+retained in the audit.
+
+#### Profile-specific extremes
+
+```yaml
+extremes:
+  enabled: true
+  selection_mode: force_within_count
+  max_value: []
+  min_value: []
+  max_period: []
+  min_period: []
+```
+
+| Common field | Allowed value and meaning |
+|---|---|
+| `enabled` | `true` activates the four exact-profile lists. Use `true` whenever any exact profile is listed. |
+| `selection_mode` | Pyomo currently supports only `force_within_count`. Forced dates consume places inside `n_representative_days`. |
+| `max_value` | List of exact profiles. Force the day containing each profile's maximum hourly value. |
+| `min_value` | List of exact profiles. Force the day containing each profile's minimum hourly value. |
+| `max_period` | List of exact profiles. Force the day with each profile's largest 24-hour sum. |
+| `min_period` | List of exact profiles. Force the day with each profile's smallest 24-hour sum. |
+
+These four lists never combine or average profiles. Every list entry is a
+separate calculation. Profile identifiers are case-sensitive and use the
+canonical form printed by the runner. For example:
+
+```yaml
+max_value:
+  - "DemandSpecificDistribution|AB_Central|2025|D_ELEC"
+  - "DemandSpecificDistribution|ON_South|2025|D_ELEC"
+min_period:
+  - "CapacityFactorTech|AB_Central|E_WIND-ON_EX"
+```
+
+The first `max_value` entry selects the maximum-hour day for the AB_Central
+profile; the second independently selects the maximum-hour day for ON_South.
+They are not summed into a Canada-wide profile. Similarly, `min_period` above
+uses only the named AB_Central wind profile. If the entries select different
+dates, both dates are forced.
+
+#### Calculated extremes: system-wide versus subsystem
+
+The same six calculated rules are available under two explicit scopes:
+
+| Scope | Meaning of `regions: all` | Number of results per enabled rule |
+|---|---|---|
+| `system_wide` | Sum all regions first, then search the combined physical profile. | Normally one date. |
+| `subsystem` | Search each region independently; regions are never added together. | Up to one date per region, or per region and minimum-generation group. |
+
+A region list limits the calculation without changing its scope. For example,
+`system_wide.regions: [AB_Central, AB_South]` searches the sum of those two
+regions, while `subsystem.regions: [AB_Central, AB_South]` searches each of the
+two regions separately.
+
+All calculated demand quantities are physical and annual-demand weighted:
+
+```text
+hourly demand (GW)
+  = annual demand (GWh) × hourly DSD / (hourly segment fraction × calendar hours)
+```
+
+All calculated generation quantities are capacity weighted:
+
+```text
+available generation (GW) = existing capacity (GW) × hourly capacity factor
+```
+
+Existing-capacity vintages for a region and technology are summed. A missing or
+zero existing capacity contributes zero and does not require a capacity-factor
+profile. The calculations represent available generation, not optimized model
+dispatch.
+
+The calculated rules are:
+
+| Rule | Selected event | Units | Technology handling |
+|---|---|---|---|
+| `include_peak_demand_day` | Maximum hourly actual demand. | GW | None. |
+| `include_min_wind_day` | Minimum 24-hour available wind generation. | GWh | Listed wind technologies are summed. |
+| `include_peak_net_load_day` | Maximum hourly demand minus available generation. | GW | Listed technologies are summed. |
+| `include_min_generation_period` | Minimum 24-hour available generation. | GWh | Each named technology group is evaluated separately. |
+| `include_max_daily_ramp_day` | Largest within-day hourly change in actual demand. | GW | None. |
+| `include_max_net_load_ramp_day` | Largest within-day hourly change in net load. | GW | Listed technologies are summed. |
+
+Ramp `direction` can be `absolute`, `upward`, or `downward`. Ramps compare
+H00→H01 through H22→H23; they do not compare H23 with the next day's H00.
+
+#### Complete system-wide example
+
+```yaml
+system_wide:
+  enabled: true
+  reference_period: first_model_period
+  regions: all
+
+  demand:
+    annual_table: demand
+    region_column: region
+    period_column: period
+    commodity_column: commodity
+    value_column: demand
+    unit_column: units
+    commodity: D_ELEC
+    profile_table: DemandSpecificDistribution
+    segfrac:
+      mode: calendar
+
+  existing_generation:
+    capacity_table: existing_capacity
+    region_column: region
+    tech_column: tech
+    value_column: capacity
+    unit_column: units
+    capacity_factor_table: CapacityFactorTech
+
+  include_peak_demand_day:
+    enabled: true
+
+  include_min_wind_day:
+    enabled: true
+    technologies:
+      - tech: E_WIND-ON_EX
+        capacity_factor_table: CapacityFactorTech
+
+  include_peak_net_load_day:
+    enabled: true
+    technologies:
+      - tech: E_WIND-ON_EX
+      - tech: E_SOLPV-CEN_EX
+
+  # Each group is a separate extreme. Keep only wind_plus_solar if one combined
+  # minimum-generation day is desired.
+  include_min_generation_period:
+    enabled: true
+    groups:
+      - name: wind
+        technologies: [E_WIND-ON_EX]
+      - name: solar
+        technologies: [E_SOLPV-CEN_EX]
+      - name: wind_plus_solar
+        technologies: [E_WIND-ON_EX, E_SOLPV-CEN_EX]
+
+  include_max_daily_ramp_day:
+    enabled: true
+    direction: absolute
+
+  include_max_net_load_ramp_day:
+    enabled: true
+    direction: absolute
+    technologies: [E_WIND-ON_EX, E_SOLPV-CEN_EX]
+```
+
+This example can select one date for peak system demand, one for minimum system
+wind, one for peak system net load, three separate minimum-generation dates,
+one system demand-ramp date, and one system net-load-ramp date. Coincident dates
+are deduplicated.
+
+#### Complete subsystem example
+
+The subsystem block uses the same database mappings and rule names. Its only
+semantic difference is that every selected region is evaluated independently:
+
+```yaml
+subsystem:
+  enabled: true
+  reference_period: first_model_period
+  regions: all  # Or [AB_Central, ON_South, QC_East].
+  demand: ...
+  existing_generation: ...
+
+  include_peak_demand_day:
+    enabled: true
+
+  include_min_wind_day:
+    enabled: true
+    technologies: [E_WIND-ON_EX]
+
+  include_peak_net_load_day:
+    enabled: true
+    technologies: [E_WIND-ON_EX, E_SOLPV-CEN_EX]
+
+  include_min_generation_period:
+    enabled: true
+    groups:
+      - name: wind
+        technologies: [E_WIND-ON_EX]
+      - name: solar
+        technologies: [E_SOLPV-CEN_EX]
+
+  include_max_daily_ramp_day:
+    enabled: true
+    direction: absolute
+
+  include_max_net_load_ramp_day:
+    enabled: true
+    direction: absolute
+    technologies: [E_WIND-ON_EX, E_SOLPV-CEN_EX]
+```
+
+With `regions: all`, peak demand can select one day for every region, peak net
+load can select one day for every region, and each minimum-generation group can
+select one day for every region that has positive capacity in that group.
+Regions with no positive capacity for a minimum-generation group are skipped
+because an all-zero series has no unique minimum-generation event. A region
+with zero capacity for one listed net-load technology still works: that
+technology contributes zero to the region's net load.
+
+Supported annual-demand units are PJ, TWh, GWh, and MWh. Supported existing-
+capacity units are GW, MW, and kW. Use `segfrac.mode: calendar` for Temoa v4,
+`database` for a valid legacy hourly SegFrac table, or `uniform_full_year` only
+when every source hour is equally weighted.
+
+#### Sparse demand-profile safeguards
+
+Some trade-demand DSD profiles are zero on most days. If none of their nonzero
+days is selected, the reduced profile cannot be normalized to one. Force one
+nonzero day for each such profile with `max_value`, for example:
+
+```yaml
+max_value:
+  - "DemandSpecificDistribution|AB_South|2025|D_ELEC_EXPORT_AB_SOUTH_US_TRADE"
+  - "DemandSpecificDistribution|QC_East|2025|D_ELEC_EXPORT_QC_EAST_US_TRADE"
+  - "DemandSpecificDistribution|SK|2025|D_ELEC_EXPORT_SK_US_TRADE"
+```
+
+These are data-coverage safeguards. They are additional forced reasons and are
+not part of the physical peak-demand, wind, or net-load equations.
+
+### Solver Options
+
+| Option | Meaning |
+|---|---|
+| `solver.name` | Pyomo solver name. `highs` is the recommended portable default. `cplex` and `gurobi` require separate installations and licences. |
+| `solver.time_limit_seconds` | Optional solver time limit. Set `null` for no configured limit. |
+| `solver.mip_gap` | Relative optimality-gap target for mixed-integer runs. It has no practical effect on a continuous LP that already solves to optimality. |
+| `solver.threads` | Optional solver-thread limit. Set `null` to use the solver default. |
+| `solver.tee` | When `true`, print the solver log. Use `false` for quieter normal runs. |
+
+CPLEX 20.1's command-line interface can solve the model under modern Python,
+but some Windows/Pyomo combinations fail afterward while reopening a quoted
+temporary log path. The bundled smoke tests use HiGHS to avoid this interface
+problem. This does not prevent using a newer compatible CPLEX installation.
 
 ## Profile Selection and Weights
 

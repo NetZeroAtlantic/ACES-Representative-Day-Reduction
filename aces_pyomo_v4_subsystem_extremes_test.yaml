@@ -1,0 +1,82 @@
+# Pyomo validation example for independently selected regional extremes.
+#
+# Run:
+#   python run_aces_tsam.py aces_pyomo_v4_subsystem_extremes_test.yaml --validate-only
+#   python run_aces_tsam.py aces_pyomo_v4_subsystem_extremes_test.yaml
+extends: aces_tsam_v4_8760.yaml #extends the majority of the base configuration from the 8760-hour model with additional configuration for the Pyomo clustering engine and extremes selection.
+
+project:
+  output_database: output/pypsa_canada_repdays_pyomo_subsystem_test.sqlite
+  overwrite_output: true
+
+clustering:
+  engine: pyomo
+  n_representative_days: 30
+
+  pyomo:
+    candidate_reduction_method: none
+    n_candidate_days: null
+
+    extremes:
+      enabled: true
+      selection_mode: force_within_count
+      max_value:
+        - "DemandSpecificDistribution|AB_South|2025|D_ELEC_EXPORT_AB_SOUTH_US_TRADE"
+        - "DemandSpecificDistribution|QC_East|2025|D_ELEC_EXPORT_QC_EAST_US_TRADE"
+        - "DemandSpecificDistribution|SK|2025|D_ELEC_EXPORT_SK_US_TRADE"
+      min_value: []
+      max_period: []
+      min_period: []
+
+      system_wide:
+        enabled: false
+
+      subsystem:
+        enabled: true
+        reference_period: first_model_period
+        # Every enabled rule below is calculated once for each listed region.
+        # Change this to all to calculate independently for every demand region.
+        regions: [AB_Central, ON_South]
+
+        include_peak_demand_day:
+          enabled: true
+
+        include_min_wind_day:
+          enabled: true
+          technologies: [E_WIND-ON_EX]
+
+        include_peak_net_load_day:
+          enabled: true
+          technologies: [E_WIND-ON_EX, E_SOLPV-CEN_EX]
+
+        # Each group is independent, so each region can contribute as many as
+        # three distinct minimum-generation dates in this example.
+        include_min_generation_period:
+          enabled: true
+          groups:
+            - name: wind
+              technologies: [E_WIND-ON_EX]
+            - name: solar
+              technologies: [E_SOLPV-CEN_EX]
+            - name: wind_plus_solar
+              technologies: [E_WIND-ON_EX, E_SOLPV-CEN_EX]
+
+        include_max_daily_ramp_day:
+          enabled: true
+          direction: absolute
+
+        include_max_net_load_ramp_day:
+          enabled: true
+          direction: absolute
+          technologies: [E_WIND-ON_EX, E_SOLPV-CEN_EX]
+
+    solver:
+      name: highs
+      time_limit_seconds: null
+      mip_gap: null
+      threads: null
+      tee: true
+
+outputs:
+  write_excel_audit: true
+  write_accuracy_metrics: true

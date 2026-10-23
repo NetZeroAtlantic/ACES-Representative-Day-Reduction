@@ -6,6 +6,8 @@ import pytest
 
 from run_aces_tsam import (
     ProfileMetadata,
+    build_extreme_audit_records,
+    build_scoped_pyomo_extreme_records,
     configure_database_schema,
     detect_database_schema,
     write_reduced_database,
@@ -202,3 +204,116 @@ def test_v4_writer_updates_weights_profiles_and_sequence(tmp_path: Path) -> None
             "SELECT season, factor FROM limit_seasonal_capacity_factor"
         ).fetchall() == [("01-01", 0.8)]
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_scoped_peak_demand_separates_system_and_regions(tmp_path: Path) -> None:
+    database = tmp_path / "extremes.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE demand (region TEXT, period INTEGER, "
+            "commodity TEXT, demand REAL, units TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO demand VALUES (?, ?, ?, ?, ?)",
+            [
+                ("R1", 2025, "D_ELEC", 100.0, "GWh"),
+                ("R2", 2025, "D_ELEC", 200.0, "GWh"),
+            ],
+        )
+
+    columns = [
+        "DemandSpecificDistribution|R1|2025|D_ELEC",
+        "DemandSpecificDistribution|R2|2025|D_ELEC",
+    ]
+    profiles = pd.DataFrame(
+        {
+            columns[0]: [0.10, 0.40, 0.20, 0.30],
+            columns[1]: [0.10, 0.10, 0.30, 0.50],
+        }
+    )
+    metadata = {
+        column: ProfileMetadata(
+            table="demand_specific_distribution",
+            logical_table="DemandSpecificDistribution",
+            key_columns=["region", "period", "demand_name"],
+            key_values=(region, 2025, "D_ELEC"),
+            season_column="season",
+            hour_column="tod",
+            value_column="dsd",
+            preserve_columns=[],
+            preserve_values=(),
+            output_rule="weighted_and_normalized_to_one",
+        )
+        for column, region in zip(columns, ["R1", "R2"])
+    }
+    shared = {
+        "enabled": True,
+        "reference_period": 2025,
+        "regions": "all",
+        "demand": {
+            "annual_table": "demand",
+            "region_column": "region",
+            "period_column": "period",
+            "commodity_column": "commodity",
+            "value_column": "demand",
+            "unit_column": "units",
+            "commodity": "D_ELEC",
+            "profile_table": "DemandSpecificDistribution",
+            "segfrac": {"mode": "uniform_full_year"},
+        },
+        "existing_generation": {},
+        "include_peak_demand_day": {"enabled": True},
+    }
+
+    records = build_scoped_pyomo_extreme_records(
+        database=database,
+        profiles=profiles,
+        selected_columns=columns,
+        metadata=metadata,
+        seasons=["01-01", "01-02"],
+        hours=["H00", "H01"],
+        engine="pyomo",
+        selection_method="force_within_count",
+        extreme_config={
+            "system_wide": shared,
+            "subsystem": shared,
+        },
+        calendar={"season_format": "%m-%d", "base_year": 2021},
+    )
+
+    assert len(records) == 3
+    assert [record["extreme_scope"] for record in records].count(
+        "system_wide"
+    ) == 1
+    assert [record["extreme_scope"] for record in records].count(
+        "subsystem"
+    ) == 2
+    assert {record["regions"] for record in records} == {
+        "R1 | R2",
+        "R1",
+        "R2",
+    }
+
+
+def test_pyomo_rejects_old_top_level_calculated_extremes(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="system_wide or extremes.subsystem"):
+        build_extreme_audit_records(
+            database=tmp_path / "unused.sqlite",
+            profiles=pd.DataFrame(),
+            selected_columns=[],
+            metadata={},
+            clustering={
+                "pyomo": {
+                    "extremes": {
+                        "enabled": False,
+                        "include_peak_demand_day": {"enabled": False},
+                    }
+                }
+            },
+            seasons=[],
+            hours=[],
+            engine="pyomo",
+            calendar={"season_format": "%m-%d", "base_year": 2021},
+        )

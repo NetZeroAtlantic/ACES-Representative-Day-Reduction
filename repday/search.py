@@ -236,17 +236,11 @@ def run_hybrid_random_weighting(
             iteration_rows.append(
                 {
                     "iteration": iteration,
-                    "metric_scope": "solver",
-                    "attribute": "",
                     "solver_status": str(status),
                     "termination_condition": str(term),
                     "acceptable_solution": False,
                     "is_best_iteration": False,
                     "objective_value": None,
-                    "selected_day_ids": ", ".join(map(str, sampled)),
-                    "random_day_ids": ", ".join(map(str, random_combination)),
-                    "forced_day_ids": ", ".join(map(str, forced_day_ids)),
-                    "optimized_day_weights": "",
                 }
             )
             continue
@@ -305,37 +299,7 @@ def run_hybrid_random_weighting(
                     "annual_energy_error"
                 ],
             }
-            bin_absolute_error_sum = float(
-                sum(pyo.value(m.err[attr.name, b]) for b in m.B)
-            )
-            objective_contribution = (
-                float(attr.weight) * bin_absolute_error_sum
-            )
             metric_values.append((attr, metrics))
-            iteration_rows.append(
-                {
-                    "iteration": iteration,
-                    "metric_scope": "attribute",
-                    "attribute": attr.name,
-                    "attribute_weight": float(attr.weight),
-                    "solver_status": str(status),
-                    "termination_condition": str(term),
-                    "acceptable_solution": True,
-                    "is_best_iteration": False,
-                    "selection_metric": "objective_value",
-                    "objective_value": obj,
-                    "bin_absolute_error_sum": bin_absolute_error_sum,
-                    "objective_contribution": objective_contribution,
-                    "selected_day_ids": ", ".join(map(str, sampled)),
-                    "random_day_ids": ", ".join(map(str, random_combination)),
-                    "forced_day_ids": ", ".join(map(str, forced_day_ids)),
-                    "optimized_day_weights": "; ".join(
-                        f"{day_id}={weight:.12g}"
-                        for day_id, weight in sorted(iteration_day_weights.items())
-                    ),
-                    **metrics,
-                }
-            )
 
         total_attribute_weight = sum(float(attr.weight) for attr, _ in metric_values)
         if metric_values and total_attribute_weight > 0:
@@ -350,29 +314,11 @@ def run_hybrid_random_weighting(
             iteration_rows.append(
                 {
                     "iteration": iteration,
-                    "metric_scope": "weighted_mean",
-                    "attribute": "<all active attributes>",
-                    "attribute_weight": total_attribute_weight,
                     "solver_status": str(status),
                     "termination_condition": str(term),
                     "acceptable_solution": True,
                     "is_best_iteration": False,
-                    "selection_metric": "objective_value",
                     "objective_value": obj,
-                    "bin_absolute_error_sum": sum(
-                        float(
-                            sum(pyo.value(m.err[attr.name, b]) for b in m.B)
-                        )
-                        for attr in active_attributes
-                    ),
-                    "objective_contribution": obj,
-                    "selected_day_ids": ", ".join(map(str, sampled)),
-                    "random_day_ids": ", ".join(map(str, random_combination)),
-                    "forced_day_ids": ", ".join(map(str, forced_day_ids)),
-                    "optimized_day_weights": "; ".join(
-                        f"{day_id}={weight:.12g}"
-                        for day_id, weight in sorted(iteration_day_weights.items())
-                    ),
                     **aggregate_metrics,
                 }
             )
@@ -474,8 +420,7 @@ def run_hybrid_random_weighting(
             iteration_history["iteration"] == best_iteration
         )
         iteration_history = iteration_history.sort_values(
-            ["iteration", "metric_scope", "attribute"],
-            kind="stable",
+            ["iteration"], kind="stable"
         ).reset_index(drop=True)
     best_result.iteration_history = iteration_history
 

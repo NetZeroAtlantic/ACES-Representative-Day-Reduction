@@ -31,7 +31,7 @@ class FakeSolver:
         )
 
 
-def test_hybrid_iterations_use_unique_combinations_and_record_metrics():
+def test_hybrid_iterations_record_one_compact_metric_row():
     hourly = pd.DataFrame(
         [
             {
@@ -65,15 +65,12 @@ def test_hybrid_iterations_use_unique_combinations_and_record_metrics():
         )
 
     history = result.iteration_history
-    aggregate = history[history["metric_scope"] == "weighted_mean"]
-    assert len(aggregate) == 5
-    assert aggregate["selected_day_ids"].nunique() == 5
-    assert aggregate["is_best_iteration"].sum() == 1
+    assert len(history) == 5
+    assert history["iteration"].nunique() == 5
+    assert history["is_best_iteration"].sum() == 1
     assert set(
         [
             "objective_value",
-            "bin_absolute_error_sum",
-            "objective_contribution",
             "chronological_rmse",
             "chronological_mae",
             "duration_curve_rmse",
@@ -83,3 +80,5 @@ def test_hybrid_iterations_use_unique_combinations_and_record_metrics():
             "annual_energy_error",
         ]
     ).issubset(history.columns)
+    assert "attribute" not in history.columns
+    assert "selected_day_ids" not in history.columns

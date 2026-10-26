@@ -3884,9 +3884,27 @@ def write_audits(
                 writer, sheet_name="Accuracy", index=False
             )
             if iteration_history is not None and not iteration_history.empty:
-                iteration_history.to_excel(
-                    writer, sheet_name="Pyomo_Iterations", index=False
-                )
+                excel_max_data_rows = 1_048_575  # One row is used by headers.
+                if len(iteration_history) <= excel_max_data_rows:
+                    iteration_history.to_excel(
+                        writer, sheet_name="Pyomo_Iterations", index=False
+                    )
+                else:
+                    pd.DataFrame(
+                        [
+                            {
+                                "status": "Stored in CSV",
+                                "rows": len(iteration_history),
+                                "reason": (
+                                    "The complete iteration history exceeds "
+                                    "Excel's 1,048,576-row worksheet limit."
+                                ),
+                                "file": "pyomo_iteration_history.csv",
+                            }
+                        ]
+                    ).to_excel(
+                        writer, sheet_name="Pyomo_Iterations", index=False
+                    )
             configuration.to_excel(
                 writer, sheet_name="Configuration", index=False
             )

@@ -671,11 +671,11 @@ Extra attributes influence day selection but are not written into ACES tables be
 | `representative_day_audit.xlsx` | Run summary, representative days, forced extremes, assignments, profile weights, accuracy, and configuration. |
 | `pyomo_forced_days.csv` | Forced dates for a Pyomo run. |
 | `pyomo_summary.csv` | Pyomo objective value and forced-day count. |
-| `pyomo_iteration_history.csv` | For hybrid random weighting, every unique tested day combination, solver outcome, objective value and per-profile contribution, optimized weights, and reconstruction errors. |
+| `pyomo_iteration_history.csv` | Compact hybrid-search history with one row per iteration: solver outcome, objective value, best-iteration flag, and weighted summary accuracy metrics. |
 
 For Pyomo runs, `weight` is optimized by the duration-curve model. `nearest_assignment_count` is a diagnostic count obtained by assigning each original day to its closest selected day. The ACES database uses `weight`, not `nearest_assignment_count`.
 
-For `hybrid_random_weighting`, complete selected-day combinations are sampled without replacement: an individual day may appear in several iterations, but the same combination is never solved twice. The Excel audit includes the same history in the `Pyomo_Iterations` sheet. It records chronological RMSE and MAE, duration-curve RMSE, MAE, and normalized RMSE, peak error, annual-energy error, optimized weights, per-profile objective contributions, and the total Pyomo objective for every successful iteration. The winning iteration is explicitly marked; the total Pyomo objective remains the metric used to choose it.
+For `hybrid_random_weighting`, complete selected-day combinations are sampled without replacement: an individual day may appear in several iterations, but the same combination is never solved twice. To keep the audit small and readable, the history contains one row per iteration rather than one row per profile. Each successful row contains the Pyomo objective, chronological RMSE and MAE, duration-curve RMSE, MAE and normalized RMSE, peak error, and annual-energy error. Accuracy values are weighted means across the active profiles. The winning iteration is explicitly marked, and the objective remains the metric used to choose it. The compact history is written to both `pyomo_iteration_history.csv` and the Excel `Pyomo_Iterations` sheet.
 
 ## Known Limitations
 

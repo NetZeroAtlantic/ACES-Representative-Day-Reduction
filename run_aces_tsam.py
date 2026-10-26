@@ -3830,10 +3830,17 @@ def write_audits(
         flatten_configuration(config), columns=["parameter", "value"]
     )
 
+    run_summary.to_csv(output_directory / "run_summary.csv", index=False)
     assignments.to_csv(output_directory / "cluster_assignments.csv", index=False)
     weights.to_csv(output_directory / "representative_day_weights.csv", index=False)
     extremes.to_csv(
         output_directory / "extreme_day_provenance.csv", index=False
+    )
+    profile_weights.to_csv(
+        output_directory / "profile_weights.csv", index=False
+    )
+    configuration.to_csv(
+        output_directory / "configuration.csv", index=False
     )
     if config.get("outputs", {}).get("write_accuracy_metrics", True):
         accuracy_table.to_csv(
@@ -3862,53 +3869,6 @@ def write_audits(
             iteration_history.to_csv(
                 output_directory / "pyomo_iteration_history.csv", index=False
             )
-    if config.get("outputs", {}).get("write_excel_audit", True):
-        excel_path = output_directory / "representative_day_audit.xlsx"
-        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-            run_summary.to_excel(
-                writer, sheet_name="Run_Summary", index=False
-            )
-            weights.to_excel(
-                writer, sheet_name="Representative_Days", index=False
-            )
-            extremes.to_excel(
-                writer, sheet_name="Forced_Extremes", index=False
-            )
-            assignments.to_excel(
-                writer, sheet_name="Day_Assignments", index=False
-            )
-            profile_weights.to_excel(
-                writer, sheet_name="Profile_Weights", index=False
-            )
-            accuracy_table.to_excel(
-                writer, sheet_name="Accuracy", index=False
-            )
-            if iteration_history is not None and not iteration_history.empty:
-                excel_max_data_rows = 1_048_575  # One row is used by headers.
-                if len(iteration_history) <= excel_max_data_rows:
-                    iteration_history.to_excel(
-                        writer, sheet_name="Pyomo_Iterations", index=False
-                    )
-                else:
-                    pd.DataFrame(
-                        [
-                            {
-                                "status": "Stored in CSV",
-                                "rows": len(iteration_history),
-                                "reason": (
-                                    "The complete iteration history exceeds "
-                                    "Excel's 1,048,576-row worksheet limit."
-                                ),
-                                "file": "pyomo_iteration_history.csv",
-                            }
-                        ]
-                    ).to_excel(
-                        writer, sheet_name="Pyomo_Iterations", index=False
-                    )
-            configuration.to_excel(
-                writer, sheet_name="Configuration", index=False
-            )
-            format_audit_workbook(writer)
 
 
 def flatten_configuration(
@@ -3932,28 +3892,6 @@ def flatten_configuration(
     else:
         rows.append((prefix, value))
     return rows
-
-
-def format_audit_workbook(writer: pd.ExcelWriter) -> None:
-    from openpyxl.styles import Font, PatternFill
-
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    header_font = Font(color="FFFFFF", bold=True)
-    for worksheet in writer.book.worksheets:
-        worksheet.freeze_panes = "A2"
-        if worksheet.max_row > 1 and worksheet.max_column > 0:
-            worksheet.auto_filter.ref = worksheet.dimensions
-        for cell in worksheet[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-        for column_cells in worksheet.columns:
-            width = max(
-                len(str(cell.value)) if cell.value is not None else 0
-                for cell in column_cells
-            )
-            worksheet.column_dimensions[
-                column_cells[0].column_letter
-            ].width = min(max(width + 2, 12), 60)
 
 
 def inspect_database(database: Path) -> pd.DataFrame:

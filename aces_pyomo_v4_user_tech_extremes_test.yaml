@@ -94,5 +94,4 @@ clustering:
       tee: true
 
 outputs:
-  write_excel_audit: true
   write_accuracy_metrics: true

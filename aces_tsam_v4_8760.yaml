@@ -4,8 +4,8 @@
 #   python run_aces_tsam.py aces_tsam_v4_8760.yaml
 
 project:
-  input_database: data/canada_8760.sqlite
-  output_database: output/canada_repdays_kmedoids_v4.sqlite
+  input_database: data/pypsa_canada_8760.sqlite
+ #output_database: output/canada_repdays_kmedoids_v4.sqlite
   output_template_database: null
   extra_attributes_directory: extra_attributes
   overwrite_output: true
@@ -150,7 +150,7 @@ aces:
 clustering:
   # tsam uses statistical clustering. Change to pyomo for duration-curve
   # optimization using the complete pyomo section below.
-  engine: tsam
+  engine: pyomo
   n_representative_days: 30
 
   attributes:
@@ -288,9 +288,9 @@ clustering:
     formulation: milp
     use_integer_weights: false
     fixed_day_ids: []
-    n_bins: 30
+    n_bins:  54
     normalization: minmax
-    n_random_iterations: 10
+    n_random_iterations: 2000
     random_seed: 40
     sampled_candidate_pool_size: null
 
@@ -471,5 +471,4 @@ validation:
   fail_on_missing_temporal_table: false
 
 outputs:
-  write_excel_audit: true
   write_accuracy_metrics: true

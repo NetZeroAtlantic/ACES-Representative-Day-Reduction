@@ -667,15 +667,17 @@ Extra attributes influence day selection but are not written into ACES tables be
 | `representative_day_weights.csv` | Representative day, weight, nearest-assignment count, and extreme status. |
 | `cluster_assignments.csv` | Original day, assigned cluster, and representative day. |
 | `extreme_day_provenance.csv` | Extreme rule, profile, region, period, technology or demand, selected date, and value. |
+| `run_summary.csv` | Run engine, requested and created representative days, forced-day count, and Pyomo objective. |
+| `profile_weights.csv` | Every profile included in clustering and its clustering weight. |
+| `configuration.csv` | Complete flattened configuration used for the run. |
 | `<engine>_accuracy.csv` | RMSE, MAE, and duration-curve RMSE by profile. |
-| `representative_day_audit.xlsx` | Run summary, representative days, forced extremes, assignments, profile weights, accuracy, and configuration. |
 | `pyomo_forced_days.csv` | Forced dates for a Pyomo run. |
 | `pyomo_summary.csv` | Pyomo objective value and forced-day count. |
 | `pyomo_iteration_history.csv` | Compact hybrid-search history with one row per iteration: solver outcome, objective value, best-iteration flag, and weighted summary accuracy metrics. |
 
 For Pyomo runs, `weight` is optimized by the duration-curve model. `nearest_assignment_count` is a diagnostic count obtained by assigning each original day to its closest selected day. The ACES database uses `weight`, not `nearest_assignment_count`.
 
-For `hybrid_random_weighting`, complete selected-day combinations are sampled without replacement: an individual day may appear in several iterations, but the same combination is never solved twice. To keep the audit small and readable, the history contains one row per iteration rather than one row per profile. Each successful row contains the Pyomo objective, chronological RMSE and MAE, duration-curve RMSE, MAE and normalized RMSE, peak error, and annual-energy error. Accuracy values are weighted means across the active profiles. The winning iteration is explicitly marked, and the objective remains the metric used to choose it. The compact history is written to both `pyomo_iteration_history.csv` and the Excel `Pyomo_Iterations` sheet.
+For `hybrid_random_weighting`, complete selected-day combinations are sampled without replacement: an individual day may appear in several iterations, but the same combination is never solved twice. To keep the audit small and readable, the history contains one row per iteration rather than one row per profile. Each successful row contains the Pyomo objective, chronological RMSE and MAE, duration-curve RMSE, MAE and normalized RMSE, peak error, and annual-energy error. Accuracy values are weighted means across the active profiles. The winning iteration is explicitly marked, and the objective remains the metric used to choose it. 
 
 ## Known Limitations
 

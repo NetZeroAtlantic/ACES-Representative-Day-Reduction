@@ -535,5 +535,4 @@ validation:
 # AUDIT OUTPUTS
 # The reduced database and core CSV audits are always written.
 outputs:
-  write_excel_audit: true
   write_accuracy_metrics: true
